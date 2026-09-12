@@ -110,8 +110,12 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: true
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         if: ${{ steps.changesets.outputs.has == 'true' }}
+        with:
+          toolchain: stable
+          cache: false
+          rustflags: ""
       - name: Configure git identity (scratchsmith-ci App)
         if: ${{ steps.changesets.outputs.has == 'true' }}
         run: |
@@ -121,6 +125,7 @@ jobs:
         if: ${{ steps.changesets.outputs.has == 'true' }}
         uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
         with:
+          # renovate: datasource=github-releases depName=knope-dev/knope extractVersion=^knope/v(?<version>.+)$
           version: 0.23.0
       - name: Open or refresh the release PR
         if: ${{ steps.changesets.outputs.has == 'true' }}

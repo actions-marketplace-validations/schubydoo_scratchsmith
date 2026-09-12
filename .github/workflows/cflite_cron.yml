@@ -67,3 +67,25 @@ jobs:
           storage-repo: https://${{ secrets.FUZZ_STORAGE_TOKEN }}@github.com/schubydoo/scratchsmith-fuzz-corpus.git
           storage-repo-branch: main
           storage-repo-branch-coverage: gh-pages
+      # Publish the report as a downloadable run artifact. GitHub Pages needs a public repo or a
+      # paid plan; the corpus repo is private, so a maintainer cannot browse gh-pages. cifuzz
+      # writes the report into the mounted workspace (coverage_report = $GITHUB_WORKSPACE/
+      # cifuzz-coverage) before it pushes to gh-pages, and the coverage script chmods the tree
+      # readable, so upload it straight from the runner — no clone, no second use of the storage
+      # PAT, no dependency on the push landing. Download the artifact, unzip, open index.html.
+      # The report lists every linked file (crates, C deps, toolchain), not just src/: cifuzz
+      # blanks COVERAGE_EXTRA_ARGS before running the coverage script, so there is no in-pipeline
+      # hook to scope it. For a src-only view use the local cargo llvm-cov replay (fuzz/README).
+      # cifuzz writes the report from a container running as root. Its `chmod +r` does not grant
+      # "other" under the default umask, so upload-artifact (which runs as the non-root runner
+      # user) hits EACCES scanning a report subdir. Grant read to all, and execute on dirs, so
+      # the runner can traverse the tree. sudo is passwordless on GitHub-hosted runners.
+      - name: Make the report readable by the runner
+        shell: bash
+        run: sudo chmod -R a+rX "$GITHUB_WORKSPACE/cifuzz-coverage/report"
+      - name: Upload the coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-coverage-report
+          path: cifuzz-coverage/report
+          if-no-files-found: error

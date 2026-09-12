@@ -148,6 +148,22 @@ pub enum Command {
         /// repeatable.
         #[arg(long = "include", value_name = "LIB")]
         include: Vec<String>,
+        /// Name-service (NSS) modules to stage for glibc lookups (comma-separated:
+        /// files, dns; or none). Fewer modules trim CVE surface. Default: files,dns.
+        #[arg(
+            long = "nss",
+            value_enum,
+            value_delimiter = ',',
+            value_name = "MODULES"
+        )]
+        nss: Vec<crate::stager::NssModule>,
+        /// Fail the pack if this library ships — resolved libs, the loader, and NSS
+        /// modules are all in scope. Matches a soname or staged file name; repeatable.
+        #[arg(long = "deny", value_name = "SONAME")]
+        deny: Vec<String>,
+        /// Fail the pack if this library does NOT ship (same scope as --deny); repeatable.
+        #[arg(long = "require", value_name = "SONAME")]
+        require: Vec<String>,
         /// Report format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
@@ -174,6 +190,41 @@ pub enum Command {
         /// Sign the pushed index with cosign (keyless), by digest.
         #[arg(long)]
         sign: bool,
+        /// Report format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+    /// Print a binary's resolved dependency tree (what `pack` would stage).
+    Graph {
+        /// Path to the dynamically linked binary to inspect.
+        binary: PathBuf,
+        /// Also resolve these extra libraries (soname or path), like `pack --include`;
+        /// repeatable — e.g. a `dlopen`'d plugin.
+        #[arg(long = "include", value_name = "LIB")]
+        include: Vec<String>,
+        /// Report format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+    /// Compare two staged rootfs directories: files added, removed, changed, size delta.
+    Diff {
+        /// The baseline rootfs directory (e.g. a previous `pack --no-build --output`).
+        before: PathBuf,
+        /// The new rootfs directory to compare against the baseline.
+        after: PathBuf,
+        /// Exit non-zero if the two directories differ (a CI drift gate).
+        #[arg(long = "exit-code")]
+        exit_code: bool,
+        /// Report format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+    /// Extract an OCI image archive back to a directory (audit an image you did not build).
+    Unpack {
+        /// The OCI-archive tarball to extract (e.g. from `pack --oci-archive`).
+        archive: PathBuf,
+        /// Directory to extract the image rootfs into (created if absent).
+        output: PathBuf,
         /// Report format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
@@ -242,6 +293,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             tz,
             init,
             include,
+            nss,
+            deny,
+            require,
             format,
         } => {
             // Load the config file (if any), apply a selected profile, then let CLI flags win.
@@ -285,6 +339,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                     file.include
                 } else {
                     include
+                },
+                nss: crate::stager::NssSelection::from_modules(if nss.is_empty() {
+                    &file.nss
+                } else {
+                    &nss
+                })?,
+                deny: if deny.is_empty() { file.deny } else { deny },
+                require: if require.is_empty() {
+                    file.require
+                } else {
+                    require
                 },
                 image: crate::image::ImageConfig {
                     entrypoint: entrypoint
@@ -379,6 +444,49 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Graph {
+            binary,
+            include,
+            format,
+        } => {
+            let report = crate::graph::build(&binary, &include)?;
+            match format {
+                Format::Text => println!("{}", report.to_text()),
+                Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+            }
+            // Print the graph first, then fail loudly on any unresolved dependency so a
+            // text-mode CI gate does not pass on a binary that could not be packed.
+            crate::graph::check_complete(&report)
+        }
+        Command::Diff {
+            before,
+            after,
+            exit_code,
+            format,
+        } => {
+            let report = crate::diff::build(&before, &after)?;
+            match format {
+                Format::Text => println!("{}", report.to_text()),
+                Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+            }
+            // With --exit-code, drift is a failure so CI can gate on it (like `git diff`).
+            if exit_code && report.has_changes() {
+                bail!("rootfs directories differ");
+            }
+            Ok(())
+        }
+        Command::Unpack {
+            archive,
+            output,
+            format,
+        } => {
+            let report = crate::unpack::run(&archive, &output)?;
+            match format {
+                Format::Text => println!("{}", report.to_text()),
+                Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -392,6 +500,86 @@ mod tests {
     fn cli_definition_is_valid() {
         // Catches malformed clap attributes (arg conflicts, bad names) at test time.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn graph_parses_binary_include_and_format() {
+        let cli = Cli::try_parse_from([
+            "scratchsmith",
+            "graph",
+            "--include",
+            "libz.so.1",
+            "--format",
+            "json",
+            "/bin/ls",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Graph {
+                binary,
+                include,
+                format,
+            }) => {
+                assert_eq!(binary, PathBuf::from("/bin/ls"));
+                assert_eq!(include, vec!["libz.so.1".to_string()]);
+                assert!(matches!(format, Format::Json));
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_parses_dirs_and_exit_code() {
+        let cli =
+            Cli::try_parse_from(["scratchsmith", "diff", "--exit-code", "old", "new"]).unwrap();
+        match cli.command {
+            Some(Command::Diff {
+                before,
+                after,
+                exit_code,
+                ..
+            }) => {
+                assert_eq!(before, PathBuf::from("old"));
+                assert_eq!(after, PathBuf::from("new"));
+                assert!(exit_code);
+            }
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unpack_parses_archive_and_output() {
+        let cli = Cli::try_parse_from(["scratchsmith", "unpack", "img.tar", "out"]).unwrap();
+        match cli.command {
+            Some(Command::Unpack {
+                archive, output, ..
+            }) => {
+                assert_eq!(archive, PathBuf::from("img.tar"));
+                assert_eq!(output, PathBuf::from("out"));
+            }
+            other => panic!("expected Unpack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_parses_deny_and_require() {
+        let cli = Cli::try_parse_from([
+            "scratchsmith",
+            "pack",
+            "--deny",
+            "libssl.so.3",
+            "--require",
+            "libc.so.6",
+            "/bin/ls",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Pack { deny, require, .. }) => {
+                assert_eq!(deny, vec!["libssl.so.3".to_string()]);
+                assert_eq!(require, vec!["libc.so.6".to_string()]);
+            }
+            other => panic!("expected Pack, got {other:?}"),
+        }
     }
 
     #[test]

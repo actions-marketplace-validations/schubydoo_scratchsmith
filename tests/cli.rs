@@ -35,7 +35,7 @@ fn help_lists_all_subcommands() {
     let out = run(&["--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["pack", "lint", "doctor", "index"] {
+    for cmd in ["pack", "lint", "doctor", "index", "graph", "diff", "unpack"] {
         assert!(stdout.contains(cmd), "help missing `{cmd}`: {stdout}");
     }
 }
@@ -114,6 +114,194 @@ fn lint_reports_hardening_for_a_real_binary() {
 }
 
 #[test]
+fn graph_prints_a_dependency_tree() {
+    let Some(bin) = small_fixture() else {
+        eprintln!("skipping: no id binary to inspect");
+        return;
+    };
+    let out = run(&["graph", bin]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The root is the binary, libc is a resolved dependency, and the loader is noted.
+    assert!(stdout.contains("id "), "root missing: {stdout}");
+    assert!(stdout.contains("libc.so"), "libc missing: {stdout}");
+    assert!(stdout.contains("interpreter:"), "loader missing: {stdout}");
+}
+
+#[test]
+fn graph_json_is_valid_and_lists_nodes() {
+    let Some(bin) = small_fixture() else {
+        eprintln!("skipping: no id binary to inspect");
+        return;
+    };
+    let out = run(&["graph", "--format", "json", bin]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    // root is the binary's real path; the first node is the root, named by its file name.
+    assert!(
+        v["root"].as_str().unwrap().ends_with("id"),
+        "root should be the id binary path: {v}"
+    );
+    assert_eq!(v["nodes"][0]["name"], "id");
+    assert!(
+        v["nodes"].as_array().map(|a| a.len() >= 2).unwrap_or(false),
+        "expected the binary plus libraries: {v}"
+    );
+}
+
+#[test]
+fn diff_flags_drift_with_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("f"), "one").unwrap();
+    std::fs::write(b.join("f"), "two").unwrap();
+    let out = run(&[
+        "diff",
+        "--exit-code",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "--exit-code must fail on drift");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("~ f"), "{stdout}");
+}
+
+#[test]
+fn diff_identical_dirs_report_no_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("f"), "same").unwrap();
+    std::fs::write(b.join("f"), "same").unwrap();
+    let out = run(&[
+        "diff",
+        "--exit-code",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "identical dirs must pass even with --exit-code"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no changes"));
+}
+
+#[test]
+fn pack_deny_gate_fails_when_library_present() {
+    // `id` links libc, so `--deny libc.so.6` must fail the pack (a CI policy gate). Uses the
+    // daemonless -n -o sink — the policy check runs before staging, so no Docker is needed.
+    let Some(bin) = small_fixture() else {
+        eprintln!("skipping: no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("rootfs");
+    let output = run(&[
+        "pack",
+        "--deny",
+        "libc.so.6",
+        "--no-build",
+        "-o",
+        out.to_str().unwrap(),
+        bin,
+    ]);
+    assert!(
+        !output.status.success(),
+        "deny of libc should fail the pack"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("library policy failed") && stderr.contains("libc.so.6"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn pack_deny_gate_covers_nss_modules() {
+    // `id` does DNS lookups, so `libresolv.so.2` is staged as an NSS module — outside the
+    // resolved dependency graph. The gate must still catch it (regression for the split
+    // between resolution.libs and the default-includes).
+    let Some(bin) = small_fixture() else {
+        eprintln!("skipping: no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("rootfs");
+    let output = run(&[
+        "pack",
+        "--deny",
+        "libresolv.so.2",
+        "--no-build",
+        "-o",
+        out.to_str().unwrap(),
+        bin,
+    ]);
+    assert!(
+        !output.status.success(),
+        "deny of a staged NSS module should fail the pack"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("library policy failed") && stderr.contains("libresolv.so.2"),
+        "{stderr}"
+    );
+}
+
+// Whether any file under `root` is named `name`.
+fn tree_has(root: &std::path::Path, name: &str) -> bool {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy() == name)
+}
+
+#[test]
+fn unpack_round_trips_an_oci_archive() {
+    // Pack daemonlessly to an OCI archive, then unpack it and confirm the rootfs is back.
+    let Some(bin) = small_fixture() else {
+        eprintln!("skipping: no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("img.oci.tar");
+    let packed = run(&["pack", "--oci-archive", archive.to_str().unwrap(), bin]);
+    assert!(
+        packed.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let dest = tmp.path().join("unpacked");
+    let out = run(&["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "unpack: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tree_has(&dest, "id"),
+        "packed binary missing from unpacked rootfs"
+    );
+    assert!(
+        tree_has(&dest, "libc.so.6"),
+        "libc missing from unpacked rootfs"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("unpacked"));
+}
+
+#[test]
 fn pack_oci_archive_writes_the_file() {
     // Exercises the `--oci-archive` sink through the CLI (daemonless — no Docker needed).
     let Some(bin) = small_fixture() else {
@@ -136,6 +324,35 @@ fn pack_oci_archive_writes_the_file() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("wrote OCI archive"), "got: {stdout}");
+}
+
+#[test]
+fn pack_nss_files_only_through_the_cli() {
+    // Exercises `--nss` from the command line (the CLI-supplied selection path in dispatch)
+    // via the daemonless -n -o sink — no Docker needed.
+    let Some(bin) = small_fixture() else {
+        eprintln!("skipping: no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("rootfs");
+    let output = run(&[
+        "pack",
+        "--nss",
+        "files",
+        "--no-build",
+        "-o",
+        out.to_str().unwrap(),
+        bin,
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let nsswitch = std::fs::read_to_string(out.join("etc/nsswitch.conf")).unwrap();
+    assert!(nsswitch.contains("hosts:          files\n"), "{nsswitch}");
+    assert!(!nsswitch.contains("dns"), "dns must be dropped: {nsswitch}");
 }
 
 #[test]

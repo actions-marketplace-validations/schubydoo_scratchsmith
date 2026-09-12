@@ -1,7 +1,18 @@
 [scratchsmith]
   --completions  value=true  multiple=false  required=false  values=[bash,zsh,fish]
 
+[diff]
+  <after>  value=true  multiple=false  required=true
+  <before>  value=true  multiple=false  required=true
+  --exit-code  value=false  multiple=false  required=false
+  --format  value=true  multiple=false  required=false  default=text  values=[text,json]
+
 [doctor]
+
+[graph]
+  <binary>  value=true  multiple=false  required=true
+  --format  value=true  multiple=false  required=false  default=text  values=[text,json]
+  --include  value=true  multiple=true  required=false
 
 [index]
   --format  value=true  multiple=false  required=false  default=text  values=[text,json]
@@ -18,6 +29,7 @@
   --ca-certs  value=false  multiple=false  required=false
   --cmd  value=true  multiple=true  required=false
   --config  value=true  multiple=false  required=false
+  --deny  value=true  multiple=true  required=false
   --entrypoint  value=true  multiple=false  required=false
   --env  value=true  multiple=true  required=false
   --format  value=true  multiple=false  required=false  default=text  values=[text,json]
@@ -27,10 +39,12 @@
   --label  value=true  multiple=true  required=false
   --max-size  value=true  multiple=false  required=false
   --no-build -n  value=false  multiple=false  required=false
+  --nss  value=true  multiple=true  required=false  values=[files,dns,none]
   --oci-archive  value=true  multiple=false  required=false
   --output -o  value=true  multiple=false  required=false
   --profile  value=true  multiple=false  required=false
   --push  value=true  multiple=false  required=false
+  --require  value=true  multiple=true  required=false
   --runtime  value=true  multiple=false  required=false  values=[docker,podman,nerdctl]
   --sbom  value=false  multiple=false  required=false
   --sbom-file  value=true  multiple=false  required=false
@@ -44,3 +58,8 @@
   --upx  value=false  multiple=false  required=false
   --user  value=true  multiple=false  required=false
   --workdir  value=true  multiple=false  required=false
+
+[unpack]
+  <archive>  value=true  multiple=false  required=true
+  --format  value=true  multiple=false  required=false  default=text  values=[text,json]
+  <output>  value=true  multiple=false  required=true

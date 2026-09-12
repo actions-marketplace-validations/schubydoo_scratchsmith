@@ -54,6 +54,80 @@ scratchsmith pack --strip --max-size 8MB ./app        # fail the build if the st
 scratchsmith lint --fail-on no-pie --fail-on no-relro ./app   # hardening gate for CI
 ```
 
+## Trim the NSS modules
+
+glibc loads name-service (NSS) modules at runtime to resolve names: hostnames to IP addresses,
+and user or group IDs to names. Scratchsmith stages a default set (local files plus DNS). If your
+program does fewer lookups, drop the modules it does not need with `--nss`. Fewer modules mean a
+smaller image and less code that could carry a CVE.
+
+```sh
+scratchsmith pack ./app                 # default: local files + DNS
+scratchsmith pack --nss files ./app     # local-file lookups only, no DNS
+scratchsmith pack --nss none ./app      # no NSS modules, for a program that resolves no names
+```
+
+`dns` covers hostname resolution only, not the network itself. A program that connects to a raw IP
+address needs no NSS module. A program that reaches a host by name over TLS also needs CA
+certificates, which you add separately with `--ca-certs`. `--nss none` also skips the generated
+`/etc/nsswitch.conf`, and `--nss files` writes one that lists local files alone. A mode without
+`files` also drops `/etc/passwd` and `/etc/group`, because glibc reads them through the `files`
+module, so user and group lookups do not work there.
+
+## Inspect the dependency graph
+
+To see what `pack` would stage without building an image, run `graph`:
+
+```sh
+scratchsmith graph ./app                            # ASCII tree of the resolved deps
+scratchsmith graph --format json ./app              # machine-readable adjacency list
+scratchsmith graph --include libplugin.so.1 ./app   # add a dlopen'd library, like pack
+```
+
+The tree shows each library in full the first time and marks a later repeat with `(*)`, so
+a shared dependency or a cycle does not print twice. A dependency that does not resolve is
+shown as `(missing)`. The last line names the loader (`PT_INTERP`).
+
+## Gate on libraries
+
+To enforce a library policy in CI, fail the pack when a forbidden library is present or a
+required one is absent:
+
+```sh
+scratchsmith pack --deny libssl.so.3 ./app        # fail if OpenSSL is staged
+scratchsmith pack --require libseccomp.so.2 ./app  # fail if seccomp is missing
+```
+
+Both flags repeat and match exactly, by soname or staged file name. The resolved libraries,
+the loader, and the NSS modules are all in scope. Read the names from `scratchsmith graph`.
+The same keys work in `scratchsmith.toml` as `deny` and `require`.
+
+## Diff two builds
+
+To catch image drift, stage two builds and compare their rootfs directories:
+
+```sh
+scratchsmith pack --no-build --output old ./app-v1
+scratchsmith pack --no-build --output new ./app-v2
+scratchsmith diff old new              # files added, removed, changed, and the size delta
+scratchsmith diff --exit-code old new  # exit non-zero on any difference (a CI gate)
+```
+
+`diff` marks an added file with `+`, a removed file with `-`, and a changed file with `~`,
+then prints the total size delta. `--format json` emits the same data for a machine.
+
+## Unpack an image
+
+To audit an image you did not build, extract its OCI archive to a directory:
+
+```sh
+scratchsmith unpack app.oci.tar ./rootfs   # apply the layers into ./rootfs
+```
+
+`unpack` reads an OCI-layout archive (what `pack --oci-archive` writes, or a skopeo/buildah
+export), applies each layer in order, and honors whiteouts. Combine it with `diff` to
+compare two images: unpack both, then run `scratchsmith diff old new`.
+
 ## Multi-arch images
 
 Scratchsmith resolves against the host's libraries, so it packs for the architecture it runs on.
