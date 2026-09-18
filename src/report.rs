@@ -399,6 +399,33 @@ mod tests {
         assert_eq!(v["nodes"][0]["name"], "app");
         assert_eq!(v["nodes"][0]["needs"][0], "/lib/libc.so.6");
         assert!(v["nodes"][0]["missing"].as_array().unwrap().is_empty());
+
+        // Pin the key sets too, not just the values: the value assertions above catch a
+        // rename or a removal, but an ADDED field would pass them silently.
+        let sorted_keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(sorted_keys(&v), ["interpreter", "missing", "nodes", "root"]);
+        assert_eq!(
+            sorted_keys(&v["nodes"][0]),
+            ["id", "missing", "name", "needs"]
+        );
+
+        // `interpreter` is an Option, so whether its key appears depends on a serde attribute
+        // rather than on the struct alone, and a static binary has no PT_INTERP. Adding
+        // skip_serializing_if later would drop the key from that output while the Some case
+        // above kept passing, so pin the None case to the same four keys.
+        let static_binary = DepGraphReport {
+            root: "/app".into(),
+            interpreter: None,
+            nodes: vec![node("/app", "app", &[], &[])],
+            missing: vec![],
+        };
+        let v = serde_json::to_value(&static_binary).unwrap();
+        assert_eq!(sorted_keys(&v), ["interpreter", "missing", "nodes", "root"]);
+        assert!(v["interpreter"].is_null(), "{v}");
     }
 
     #[test]
@@ -710,5 +737,54 @@ mod tests {
             sorted_keys(&json["manifests"][0]),
             ["digest", "platform", "source"]
         );
+    }
+
+    #[test]
+    fn diff_report_schema_is_stable() {
+        // The `diff --format json` output is a SemVer-covered contract (v1.2): CI gates on it
+        // alongside `--exit-code`. Pin the top-level key set and the `added[]`/`removed[]`
+        // sub-schema, so an added, removed, or renamed field is caught here, never silent drift.
+        let report = DiffReport {
+            added: vec![DiffFile {
+                path: "lib/libnew.so.1".into(),
+                size: 10,
+            }],
+            removed: vec![DiffFile {
+                path: "lib/libgone.so.1".into(),
+                size: 4,
+            }],
+            changed: vec!["bin/app".into()],
+            size_before: 100,
+            size_after: 200,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let sorted_keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            sorted_keys(&json),
+            ["added", "changed", "removed", "size_after", "size_before"]
+        );
+        assert_eq!(sorted_keys(&json["added"][0]), ["path", "size"]);
+        assert_eq!(sorted_keys(&json["removed"][0]), ["path", "size"]);
+    }
+
+    #[test]
+    fn unpack_report_schema_is_stable() {
+        // The `unpack --format json` output is a SemVer-covered contract (v1.2). Pin the exact
+        // key set so an auditor scripting against an image it did not build cannot break on a
+        // silent rename.
+        let report = UnpackReport {
+            source: "app.tar".into(),
+            dir: "/tmp/rootfs".into(),
+            layers: 2,
+            files: 17,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let mut keys: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["dir", "files", "layers", "source"]);
     }
 }
