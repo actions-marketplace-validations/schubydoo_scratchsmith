@@ -268,6 +268,117 @@ fn add_file_copies_host_files_into_the_rootfs() {
     assert!(stderr.contains("is a directory"), "{stderr}");
 }
 
+#[test]
+fn symlinks_preserve_puts_the_named_binary_path_back() {
+    // Packing a symlinked binary stages the REAL file and, by default, nothing else: the
+    // path the user typed is gone from the image. --symlinks puts it back as a link.
+    let bin = env!("CARGO_BIN_EXE_scratchsmith");
+    let Some(fixture) = small_fixture() else {
+        eprintln!("skipping: no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real/id-real");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::copy(fixture, &real).unwrap();
+    let link = tmp.path().join("bin/id-link");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("../real/id-real", &link).unwrap();
+
+    let pack = |mode: Option<&str>, out: &Path| {
+        let mut args = vec!["pack", "-n", "-o", out.to_str().unwrap()];
+        if let Some(m) = mode {
+            args.push("--symlinks");
+            args.push(m);
+        }
+        args.push(link.to_str().unwrap());
+        let done = Command::new(bin).args(&args).output().unwrap();
+        assert!(
+            done.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+    };
+
+    // Default: the real file only, exactly as every release before this one packed it.
+    let flat = tmp.path().join("flat");
+    pack(None, &flat);
+    let named = flat.join(link.strip_prefix("/").unwrap());
+    assert!(
+        flat.join(real.strip_prefix("/").unwrap()).exists(),
+        "the real binary must always be staged"
+    );
+    assert!(
+        named.symlink_metadata().is_err(),
+        "copy-all must not create the named path"
+    );
+
+    // preserve: the named path is back, as a link, and its target is the staged real file.
+    let kept = tmp.path().join("kept");
+    pack(Some("preserve"), &kept);
+    let named = kept.join(link.strip_prefix("/").unwrap());
+    let md = named
+        .symlink_metadata()
+        .expect("preserve must create the named path");
+    assert!(md.file_type().is_symlink(), "the named path must be a link");
+    // The value must be RELATIVE. An absolute one resolves against the host root, so
+    // `named.exists()` alone would pass on the host file whether or not the staged copy is
+    // there, which measures nothing. Resolve it by hand inside the staging tree instead.
+    let value = std::fs::read_link(&named).unwrap();
+    assert!(
+        value.is_relative(),
+        "the link value must be relative, got {}",
+        value.display()
+    );
+    let staged_real = kept.join(real.strip_prefix("/").unwrap());
+    assert_eq!(
+        named.parent().unwrap().join(&value).canonicalize().unwrap(),
+        staged_real.canonicalize().unwrap(),
+        "the link must resolve to the staged binary, not to the host one"
+    );
+}
+
+#[test]
+fn the_report_names_the_loader_the_image_carries() {
+    // The loader's path is chosen by the binary's PT_INTERP, not by scratchsmith, so a pack
+    // that does not name it leaves the one host-dependent path in the image unrecorded.
+    let bin = env!("CARGO_BIN_EXE_scratchsmith");
+    let Some(fixture) = small_fixture() else {
+        eprintln!("skipping: no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(bin)
+        .args([
+            "pack",
+            "-n",
+            "-o",
+            tmp.path().join("rootfs").to_str().unwrap(),
+            "--format",
+            "json",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let interp = report["interpreter"]
+        .as_str()
+        .expect("a dynamic binary must report its loader");
+    // The reported path must be the one actually staged, not a guess.
+    assert!(
+        tmp.path()
+            .join("rootfs")
+            .join(interp.trim_start_matches('/'))
+            .exists(),
+        "the reported loader {interp} is not in the staged rootfs"
+    );
+}
+
 // Pick a locale this host can actually stage: one already built as a directory, else one
 // localedef can compile from /usr/share/i18n. Both are absent on a minimal container, and a
 // host that cannot supply locale data cannot prove anything about staging it.

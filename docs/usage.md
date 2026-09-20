@@ -54,6 +54,15 @@ scratchsmith pack --strip --max-size 8MB ./app        # fail the build if the st
 scratchsmith lint --fail-on no-pie --fail-on no-relro ./app   # hardening gate for CI
 ```
 
+The report names the loader the image carries, because the binary's `PT_INTERP` chooses that
+path and not scratchsmith. `--format json` carries it as `interpreter`, so a job can assert it
+without unpacking the image. An ELF that carries no `PT_INTERP` reports null, which is the
+case for a static binary.
+
+```sh
+scratchsmith pack --format json ./app | jq -e '.interpreter == "/lib64/ld-linux-x86-64.so.2"'
+```
+
 ## Trim the NSS modules
 
 glibc loads name-service (NSS) modules at runtime to resolve names: hostnames to IP addresses,
@@ -96,10 +105,44 @@ that the layer stays reproducible. A source at mode `0600` is therefore world-re
 the image. Do not add a secret this way. Only a `--no-build --output` rootfs keeps the source
 bits.
 
-The flag takes regular files only. If the source is missing or is a directory, the pack fails
-and names the path. If `DST` is already in the image, the pack fails as well, so a second entry
-for one path cannot quietly replace the first. Scratchsmith never skips a file you asked for.
-A skipped file means an image that ships without it. The added files count toward `--max-size`.
+With the default `--symlinks copy-all`, the flag takes regular files only. If the source is
+missing or is a directory, the pack fails and names the path. If `DST` is already in the image,
+the pack fails as well, so a second entry for one path cannot quietly replace the first. A file
+you asked for is never skipped without a word. The added files count toward `--max-size`.
+
+Another `--symlinks` mode changes two of those rules, and only for a source that is itself a
+symlink. A preserved link is staged as a link, so a link to a directory no longer fails. Under
+`skip-unsafe` an entry the pack cannot honor stages nothing and warns. The section below has
+the detail.
+
+## Keep a symlink as a symlink
+
+Scratchsmith copies the content of a symlink you name, so the image gets a regular file and
+not the link. That loses the path itself. If you pack `/usr/bin/python3`, which is a link to
+`python3.13`, the image holds the real file and nothing at `/usr/bin/python3`. A container
+that runs the name rather than the target then fails to start. `--symlinks` chooses what
+happens instead.
+
+```sh
+scratchsmith pack --symlinks preserve /usr/bin/python3
+```
+
+| Mode | What a named symlink becomes |
+|---|---|
+| `copy-all` | The target's content, at the named path. This is the default, and what every earlier release did. |
+| `preserve` | A link. A target outside the image makes it dangle, and the pack warns. |
+| `copy-unsafe` | A link for a target inside the image. The target's content for a target outside it. |
+| `skip-unsafe` | A link for a target inside the image. Nothing at all for a target outside it, and the pack warns. |
+
+The mode covers the packed binary's own path and each `--add-file` source. Resolved libraries
+are not in scope, because the loader decides those and the stager already recreates the
+soname links it needs.
+
+Preserving a link never pulls its target into the image. You add the target yourself, with
+`--add-file`, or you accept a link that dangles. The packed binary is the exception: its real
+file is always staged, so a preserved link to it always resolves. Added files are staged in
+the order you list them, so a link can point at an earlier `--add-file` but not at a later
+one.
 
 ## Stage a locale
 
