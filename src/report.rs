@@ -1,5 +1,4 @@
 //! Render the size + security report as text or JSON (`--format json` for CI gates).
-//! See Tasks 2.4, 2.8.
 
 use crate::stager::SizeReport;
 use crate::supplychain::ScanSummary;
@@ -43,8 +42,8 @@ pub fn human_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-/// The outcome of a pack, emitted as text or JSON (Task 2.8). Fields are stable so
-/// the JSON can gate CI.
+/// The outcome of a pack, emitted as text or JSON. Fields are stable so the JSON can
+/// gate CI.
 #[derive(Debug, Clone, Serialize)]
 pub struct PackReport {
     /// Image tag when an image was built (loaded into Docker).

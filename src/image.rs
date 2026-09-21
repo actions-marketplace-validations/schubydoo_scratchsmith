@@ -1,6 +1,6 @@
 //! Assemble the staged rootfs into a container image. Sinks: the local Docker daemon
-//! via a docker-archive tarball (Task 1.6), and a daemonless **OCI archive** (Task 5.1).
-//! Registry push (5.2) is next. Layers are reproducible (2.9).
+//! via a docker-archive tarball, a daemonless **OCI archive**, and a direct registry
+//! push. Layers are reproducible.
 
 use crate::stager::StagedTree;
 use anyhow::{bail, Context, Result};
@@ -9,8 +9,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-/// User-configurable image metadata (Task 2.2). Empty fields fall back to defaults:
-/// the entrypoint defaults to the packed binary, and PATH is always present.
+/// User-configurable image metadata. Empty fields fall back to defaults: the entrypoint
+/// defaults to the packed binary, and PATH is always present.
 #[derive(Debug, Clone, Default)]
 pub struct ImageConfig {
     /// Overrides the default entrypoint (the packed binary) when non-empty.
@@ -71,7 +71,7 @@ pub fn load_into_docker(
 }
 
 /// Write an **OCI image-layout** tarball (`oci-layout` + `index.json` + `blobs/sha256/*`)
-/// with no Docker daemon — Task 5.1. `skopeo`, `buildah`, and OCI-aware tooling read this
+/// with no Docker daemon. `skopeo`, `buildah`, and OCI-aware tooling read this
 /// shape (as does `docker load` where the containerd image store is enabled). The config
 /// and layer blobs are the exact same bytes the docker sink uses — so the image ID is
 /// identical across sinks; the OCI manifest/index here are new artifacts this path adds.
