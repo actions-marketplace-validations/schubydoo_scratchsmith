@@ -1,0 +1,32 @@
+name: Sign and verify an image
+description: >-
+  Sign a pushed image by digest with keyless cosign, then verify the signature immediately.
+  Shared by the `image` and `toolbox` jobs in release.yml.
+
+inputs:
+  digest:
+    description: The digest the build-push step returned, in `sha256:…` form.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Sign and verify the image (keyless)
+      shell: bash
+      env:
+        DIGEST: ${{ inputs.digest }}
+      run: |
+        set -euo pipefail
+        # `required: true` above is documentation only — the runner does not enforce it for a
+        # composite action, and actionlint's input check is suppressed for `$/` call sites. An
+        # empty digest would reach cosign as `ghcr.io/owner/repo@` and fail naming cosign
+        # rather than the real cause.
+        [ -n "$DIGEST" ] || { echo "::error::sign-and-verify got an empty digest input; check the build-push step id and outputs"; exit 1; }
+        ref="ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}"
+        # --recursive also signs each per-platform manifest, not just the index, so a consumer
+        # pinning a per-arch digest can still verify.
+        cosign sign --yes --recursive "$ref"
+        # Prove the signature is verifiable now, not via a later bug report.
+        cosign verify "$ref" \
+          --certificate-identity-regexp "^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/" \
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
