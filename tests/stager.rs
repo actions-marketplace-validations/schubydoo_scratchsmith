@@ -7,15 +7,9 @@ use scratchsmith::stager::{
     stage, stage_default_includes, strip_and_measure, NssSelection, SymlinkMode,
 };
 use std::path::Path;
-use std::process::Command;
 
-fn strip_available() -> bool {
-    Command::new("strip")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+mod common;
+use common::{skip_required, strip_available, upx_available, walk_contains};
 
 #[test]
 fn stages_a_real_binary_into_a_runnable_tree() {
@@ -76,28 +70,10 @@ fn default_includes_add_nss_and_passwd_from_host() {
     );
 }
 
-// Small recursive check so the test does not hard-code the libc directory triplet.
-fn walk_contains(root: &Path, name: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if walk_contains(&path, name) {
-                return true;
-            }
-        } else if path.file_name().is_some_and(|n| n == name) {
-            return true;
-        }
-    }
-    false
-}
-
 #[test]
 fn strip_reduces_payload_size() {
     if !strip_available() {
-        eprintln!("skipping strip_reduces_payload_size: no strip");
+        skip_required("no strip");
         return;
     }
     let bin = Path::new(env!("CARGO_BIN_EXE_scratchsmith"));
@@ -118,21 +94,17 @@ fn strip_reduces_payload_size() {
     );
 }
 
-fn upx_available() -> bool {
-    Command::new("upx")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn upx_compresses_the_binary_only() {
     // /usr/bin/id is a small real dynamic binary — fast to compress and present on any glibc
     // host — so this stays quick where a 40 MB self-pack would not.
     let bin = Path::new("/usr/bin/id");
-    if !upx_available() || !bin.exists() {
-        eprintln!("skipping upx_compresses_the_binary_only: no upx or no /usr/bin/id");
+    if !upx_available() {
+        skip_required("no upx");
+        return;
+    }
+    if !bin.exists() {
+        skip_required("no id binary to pack");
         return;
     }
     let resolution = resolve(bin, &Sysroot::new("/")).expect("resolution");

@@ -1,6 +1,7 @@
 site_name: Scratchsmith
-# Lead the SEO/unfurl meta description with what ships today: it travels detached
-# from the "not daemonless yet" caveat. The visible tagline stays "daemonless".
+# The meta description travels detached from the page, into search results and unfurls,
+# so it has to stand alone. It names the outcome rather than the mechanism. The visible
+# tagline on the page stays "daemonless".
 site_description: Package a prebuilt dynamic Linux binary into a minimal, non-root FROM scratch OCI image — no Dockerfile, no static linking.
 site_url: https://schubydoo.github.io/scratchsmith/
 site_author: schubydoo
@@ -63,7 +64,13 @@ markdown_extensions:
       permalink: true
   - pymdownx.details
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  # base_path reaches the repo root so docs/index.md can include the capability table from
+  # README.md. README is the one copy on purpose: GitHub renders it natively and ignores the
+  # HTML-comment section markers, whereas a snippet directive in README would render as literal
+  # text there. check_paths makes a moved or renamed snippet a build failure, not a silent gap.
+  - pymdownx.snippets:
+      base_path: ['.', 'docs']
+      check_paths: true
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.superfences:
@@ -85,6 +92,7 @@ nav:
   - Usage: usage.md
   - GitHub Action: github-action.md
   - Configuration: configuration.md
+  - Deprecations: deprecations.md
   - Verifying releases: verifying.md
   - Comparison & limitations: comparison.md
   - Architecture: architecture.md

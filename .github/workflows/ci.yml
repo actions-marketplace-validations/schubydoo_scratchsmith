@@ -34,6 +34,20 @@ jobs:
       # Keep the curl|bash installer clean. shellcheck ships on the runner, so no action.
       - name: ShellCheck (install.sh)
         run: shellcheck install.sh
+      # A bare `eprintln!("skipping: …"); return;` makes nextest record the test as PASSED, so a
+      # runner that lost a tool reports a green suite having run nothing. tests/common's
+      # skip_required and skip_optional are the only two ways to skip. This keeps it that way:
+      # the 56 existing sites were converted by hand, and the next one would have to be too.
+      - name: No hand-rolled test skips
+        run: |
+          set -euo pipefail
+          hits=$(grep -rn 'eprintln!("skipping' tests/ --include='*.rs' \
+            --exclude-dir=common || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Use tests/common::skip_required or skip_optional, not a bare eprintln."
+            echo "$hits"
+            exit 1
+          fi
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: stable
@@ -90,10 +104,12 @@ jobs:
       # nextest instead of `cargo test`: same gate, plus a junit.xml (the ci
       # profile in .config/nextest.toml) — the only format Codecov Test Analytics
       # ingests. Prebuilt binary via install-action.
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-nextest
-      # upx isn't preinstalled; the --upx pack tests skip without it (Task 5.3).
+      # upx isn't preinstalled; the --upx pack tests skip without it.
+      # ⚠️ Required by tests/common::skip_required — dropping this step FAILS the upx tests
+      # under CI rather than skipping them. That is the point: a skip reads as a pass.
       - name: Install upx
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends upx-ucl
       - name: Test (nextest → JUnit)
@@ -124,13 +140,14 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
           rustflags: ""
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-llvm-cov
       # Enforce the line floor (baseline ~94.5%) and emit lcov. cargo-llvm-cov
       # writes lcov.info before the threshold check, so the upload still runs on a
       # floor failure.
       # upx isn't preinstalled; without it the --upx pack tests skip and their lines look uncovered.
+      # ⚠️ Required by tests/common::skip_required — see the note on the test job's copy.
       - name: Install upx
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends upx-ucl
       - name: Coverage (lcov + line floor)
@@ -149,7 +166,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-audit,cargo-deny
       - name: Audit
@@ -166,7 +183,7 @@ jobs:
 
   completions:
     # Generate the shell completion scripts and prove each one sources cleanly
-    # under its own shell (Task 3.6 AC). bash ships on the runner; install zsh/fish.
+    # under its own shell. bash ships on the runner; install zsh/fish.
     name: shell completions
     runs-on: ubuntu-latest
     steps:
@@ -187,14 +204,22 @@ jobs:
       - run: cargo build
       - name: Generate and source completions
         run: |
+          set -euo pipefail
           bin=target/debug/scratchsmith
           "$bin" --completions bash > ss.bash
           "$bin" --completions zsh  > _scratchsmith
           "$bin" --completions fish > ss.fish
-          bash --noprofile --norc -c 'source ss.bash' && echo "bash: sourced OK"
+          # Each shell gets its OWN statement, never `cmd && echo "... OK"`. POSIX `set -e` is
+          # ignored for every command of an AND-OR list except the last, so under the `&&` form
+          # a broken bash or zsh completion left this REQUIRED job green. Only the fish line was
+          # gated, and only because it happened to be last.
+          bash --noprofile --norc -c 'source ss.bash'
+          echo "bash: sourced OK"
           # Set fpath BEFORE compinit (it reads fpath when it runs).
-          zsh -c 'fpath=($PWD $fpath); autoload -Uz compinit; compinit -u; source ./_scratchsmith' && echo "zsh: sourced OK"
-          fish -c 'source ss.fish' && echo "fish: sourced OK"
+          zsh -c 'fpath=($PWD $fpath); autoload -Uz compinit; compinit -u; source ./_scratchsmith'
+          echo "zsh: sourced OK"
+          fish -c 'source ss.fish'
+          echo "fish: sourced OK"
 
   musl:
     # Gate the shipped artifact's invariant on EVERY PR, not just at release: the
@@ -219,7 +244,7 @@ jobs:
           # renovate: datasource=github-releases depName=ziglang/zig
           version: 0.15.1
           use-cache: false
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-zigbuild@0.23.0
       # Debug build: the point is the link, not optimization — reuse the warm cache

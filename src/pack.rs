@@ -130,7 +130,7 @@ struct StagedRootfs {
 // Returns the tree, the size report, the loader path and any include warnings (no printing).
 fn build_rootfs(binary: &Path, dest: &Path, opts: &PackOptions) -> Result<StagedRootfs> {
     let info = resolver::read_elf_info(binary)?;
-    // Reject musl up front rather than staging a subtly broken image (Task 2.5).
+    // Reject musl up front rather than staging a subtly broken image.
     resolver::ensure_glibc(&info)?;
 
     let mut warnings = Vec::new();
@@ -344,6 +344,36 @@ pub fn pack(binary: &Path, opts: &PackOptions, sink: Sink) -> Result<PackReport>
     }
 }
 
+/// What `finish_staging` produced. `extras` matters only to the image sinks (tini wrapping);
+/// `stage_only` ignores it.
+struct Finished {
+    extras: stager::RuntimeResult,
+    sbom: Option<String>,
+    scan: Option<ScanSummary>,
+}
+
+// Everything BOTH sinks do after `build_rootfs`, in an order that matters: runtime extras,
+// added files, locales, the locale warning, the max-size gate, then the SBOM and the scan --
+// those two last because they read the staged tree, which is temporary for an image sink.
+//
+// Extracted because keeping two copies in step is a PROVEN hazard rather than a theoretical
+// one: `--locale` and `--symlinks` each had to be added to both, and a third addition that
+// reached only one would silently apply to one sink and not the other.
+fn finish_staging(dest: &Path, opts: &PackOptions, warnings: &mut Vec<String>) -> Result<Finished> {
+    let extras = stager::stage_runtime_extras(dest, &opts.extras)?;
+    warnings.extend(stager::stage_added_files(
+        dest,
+        &opts.add_files,
+        opts.symlinks,
+    )?);
+    stager::stage_locales(dest, &opts.locales)?;
+    warnings.extend(locale_env_warning(&opts.locales, &opts.image.env));
+    enforce_max_size(dest, opts.max_size)?;
+    let sbom = maybe_sbom(dest, opts.sbom.as_ref())?;
+    let scan = maybe_scan(dest, sbom.as_deref(), opts.scan.as_ref())?;
+    Ok(Finished { extras, sbom, scan })
+}
+
 /// Stage `binary`'s rootfs into `out_dir` and stop — no image is built (`-n -o`).
 pub fn stage_only(binary: &Path, out_dir: &Path, opts: &PackOptions) -> Result<PackReport> {
     // No image is built here, so there is nothing to smoke-run. The CLI blocks --smoke --no-build,
@@ -357,17 +387,8 @@ pub fn stage_only(binary: &Path, out_dir: &Path, opts: &PackOptions) -> Result<P
         mut warnings,
         interpreter,
     } = build_rootfs(binary, out_dir, opts)?;
-    stager::stage_runtime_extras(out_dir, &opts.extras)?;
-    warnings.extend(stager::stage_added_files(
-        out_dir,
-        &opts.add_files,
-        opts.symlinks,
-    )?);
-    stager::stage_locales(out_dir, &opts.locales)?;
-    warnings.extend(locale_env_warning(&opts.locales, &opts.image.env));
-    enforce_max_size(out_dir, opts.max_size)?;
-    let sbom = maybe_sbom(out_dir, opts.sbom.as_ref())?;
-    let scan = maybe_scan(out_dir, sbom.as_deref(), opts.scan.as_ref())?;
+    // `extras` is unused here: no image is built, so there is no config to wrap with tini.
+    let Finished { sbom, scan, .. } = finish_staging(out_dir, opts, &mut warnings)?;
     Ok(PackReport {
         tag: None,
         archive: None,
@@ -409,18 +430,9 @@ fn stage_for_image(binary: &Path, opts: &PackOptions) -> Result<StagedImage> {
         mut warnings,
         interpreter,
     } = build_rootfs(binary, &dest, opts)?;
-    let extras = stager::stage_runtime_extras(&dest, &opts.extras)?;
-    warnings.extend(stager::stage_added_files(
-        &dest,
-        &opts.add_files,
-        opts.symlinks,
-    )?);
-    stager::stage_locales(&dest, &opts.locales)?;
-    warnings.extend(locale_env_warning(&opts.locales, &opts.image.env));
-    enforce_max_size(&dest, opts.max_size)?;
-    // Generate the SBOM and scan while the staged rootfs still exists (dest is temporary).
-    let sbom = maybe_sbom(&dest, opts.sbom.as_ref())?;
-    let scan = maybe_scan(&dest, sbom.as_deref(), opts.scan.as_ref())?;
+    // finish_staging generates the SBOM and scan while the staged rootfs still exists (dest is
+    // temporary), which is why this call sits here rather than after the image config.
+    let Finished { extras, sbom, scan } = finish_staging(&dest, opts, &mut warnings)?;
 
     // Effective image config: if --init staged tini, wrap the entrypoint so tini is
     // pid 1 and reaps/forwards for the real binary.
@@ -489,8 +501,8 @@ pub fn run(binary: &Path, opts: &PackOptions) -> Result<PackReport> {
     })
 }
 
-/// Pack `binary` into a daemonless OCI-archive tarball at `out` (Task 5.1). No Docker
-/// daemon is contacted; `docker load` / `skopeo copy oci-archive:<out>` accept the result.
+/// Pack `binary` into a daemonless OCI-archive tarball at `out`. No Docker daemon is
+/// contacted; `docker load` / `skopeo copy oci-archive:<out>` accept the result.
 fn to_oci_archive(binary: &Path, opts: &PackOptions, out: &Path) -> Result<PackReport> {
     if opts.smoke {
         bail!("--smoke needs a running image, so it isn't supported with --oci-archive; load the archive (docker load / skopeo) and run it separately, or drop --smoke");
@@ -513,9 +525,9 @@ fn to_oci_archive(binary: &Path, opts: &PackOptions, out: &Path) -> Result<PackR
     })
 }
 
-/// Pack `binary` and push it straight to a registry reference (Task 5.2) — no Docker
-/// daemon. Credentials come from the local Docker config; blobs the registry already has
-/// are skipped.
+/// Pack `binary` and push it straight to a registry reference — no Docker daemon.
+/// Credentials come from the local Docker config; blobs the registry already has are
+/// skipped.
 fn to_push(binary: &Path, opts: &PackOptions, reference: &str) -> Result<PackReport> {
     if opts.smoke {
         bail!("--smoke needs a running image, so it isn't supported with --push; pull the pushed image and run it separately, or drop --smoke");

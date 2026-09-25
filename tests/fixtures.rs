@@ -1,28 +1,15 @@
-//! Real-ELF fixtures compiled at test time. Task 1.3 exercises the search logic with
-//! scripted dependency graphs; these confirm the goblin-backed parser and resolver
-//! agree with what an actual linker emits (DT_RPATH vs DT_RUNPATH, $ORIGIN, versioned
-//! sonames). Skipped when no C compiler is available.
+//! Real-ELF fixtures compiled at test time. The unit tests in `src/resolver.rs` drive the
+//! search logic through scripted dependency graphs; these confirm the goblin-backed parser
+//! and resolver agree with what an actual linker emits (DT_RPATH vs DT_RUNPATH, $ORIGIN,
+//! versioned sonames). Skipped when no C compiler is available.
 
 use scratchsmith::pack::PackOptions;
 use scratchsmith::resolver::{read_elf_info, resolve, Sysroot};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn tool_available(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn cc_available() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+mod common;
+use common::{cc_available, skip_optional, skip_required, tool_available, walk_contains};
 
 fn cc(args: &[&str]) {
     let out = Command::new("cc").args(args).output().expect("run cc");
@@ -77,7 +64,7 @@ fn build_fixture(dir: &Path, app_name: &str, dtag_flag: &str) -> PathBuf {
 #[test]
 fn goblin_reads_rpath_and_runpath_as_the_linker_emits_them() {
     if !cc_available() {
-        eprintln!("skipping: no C compiler");
+        skip_required("no C compiler");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -96,7 +83,7 @@ fn goblin_reads_rpath_and_runpath_as_the_linker_emits_them() {
 #[test]
 fn resolves_a_real_binary_via_origin_rpath_and_versioned_soname() {
     if !cc_available() {
-        eprintln!("skipping: no C compiler");
+        skip_required("no C compiler");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -129,7 +116,7 @@ fn resolves_a_real_binary_via_origin_rpath_and_versioned_soname() {
 #[test]
 fn musl_binaries_are_detected_and_pack_hard_fails() {
     if !tool_available("musl-gcc") {
-        eprintln!("skipping: no musl-gcc");
+        skip_optional("no musl-gcc");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -162,7 +149,7 @@ fn musl_binaries_are_detected_and_pack_hard_fails() {
 #[test]
 fn dlopen_use_is_detected() {
     if !cc_available() {
-        eprintln!("skipping: no C compiler");
+        skip_required("no C compiler");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -202,7 +189,7 @@ fn dlopen_use_is_detected() {
 #[test]
 fn pack_warns_about_dlopen_and_include_stages_extra_libs() {
     if !cc_available() {
-        eprintln!("skipping: no C compiler");
+        skip_required("no C compiler");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -238,21 +225,4 @@ fn pack_warns_about_dlopen_and_include_stages_extra_libs() {
         walk_contains(&out, "libz.so.1"),
         "--include libz.so.1 should be staged"
     );
-}
-
-fn walk_contains(root: &Path, name: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if walk_contains(&path, name) {
-                return true;
-            }
-        } else if path.file_name().is_some_and(|n| n == name) {
-            return true;
-        }
-    }
-    false
 }

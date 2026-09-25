@@ -1,5 +1,5 @@
 //! Load `scratchsmith.toml`, optionally select a `[profile.<name>]`, and merge with CLI
-//! flags (flags win). See Tasks 2.6 and 5.5.
+//! flags (flags win).
 
 use crate::supplychain::{SbomFormat, Severity};
 use anyhow::{bail, Context, Result};
@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 /// A pack configuration read from `scratchsmith.toml`. Every field is optional so a config
 /// can set just what it needs; a selected profile layers over the base, and the CLI overrides
-/// whatever it also specifies. Covers every *packing* flag (Task 5.5) — the delivery sinks
-/// `--oci-archive` / `-n -o` and the display-only `--format` stay CLI-only.
+/// whatever it also specifies. Covers every *packing* flag — the delivery sinks
+/// `--oci-archive` and `-n -o`, and the display-only `--format`, stay CLI-only.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)] // an unknown key is a typo, not a silent no-op
 pub struct Config {
@@ -110,7 +110,31 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        cfg.warn_about_nested_profiles(path);
+        Ok(cfg)
+    }
+
+    /// `[profile.a.profile.b]` parses, because a profile has the same shape as the base config,
+    /// and then `layer` drops it. No `--profile` value can name it, so the keys inside never
+    /// apply. Warn rather than reject: rejecting a file that packs today is a tightening, which
+    /// `COMPATIBILITY.md` makes major-only. 2.0 rejects it.
+    fn warn_about_nested_profiles(&self, path: &Path) {
+        let mut names: Vec<&str> = self
+            .profile
+            .iter()
+            .filter(|(_, nested)| !nested.profile.is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        names.sort();
+        for name in names {
+            eprintln!(
+                "warning: a nested profile is deprecated; {} defines one under [profile.{name}], and scratchsmith ignores it. Move it to a top-level [profile.<name>] table. scratchsmith 2.0 rejects it. See {}",
+                path.display(),
+                crate::image::DEPRECATIONS_URL
+            );
+        }
     }
 
     /// Layer the named profile over this base config and return the result. Unknown name is a

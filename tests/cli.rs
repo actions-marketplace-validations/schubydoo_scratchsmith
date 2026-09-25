@@ -1,25 +1,18 @@
 //! End-to-end checks against the built binary: exit codes and top-level output.
-//! These pin the contract Task 1.1 promises (help lists subcommands, version works,
-//! stubs fail loudly) independent of the library's internals.
+//! These pin the `COMPATIBILITY.md` surface — help lists every subcommand, `--version`
+//! works, a usage error exits 2 — independent of the library's internals.
 
 use std::process::{Command, Output};
+
+mod common;
+use common::skip_required;
+use common::small_fixture_str as small_fixture;
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_scratchsmith"))
         .args(args)
         .output()
         .expect("failed to run scratchsmith binary")
-}
-
-// A tiny dynamic-glibc binary to PACK in the sink/profile tests — they exercise the
-// delivery/config logic, not the binary itself. `/usr/bin/id` (~50 KB) packs almost
-// instantly, whereas packing the ~130 MB debug binary dominated their runtime (30–45s
-// each in CI). Returns None when absent so the test skips rather than panicking on a
-// minimal host (parity with tests/pack.rs::small_fixture).
-fn small_fixture() -> Option<&'static str> {
-    ["/usr/bin/id", "/bin/id"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
 }
 
 #[test]
@@ -116,7 +109,7 @@ fn lint_reports_hardening_for_a_real_binary() {
 #[test]
 fn graph_prints_a_dependency_tree() {
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to inspect");
+        skip_required("no id binary to inspect");
         return;
     };
     let out = run(&["graph", bin]);
@@ -135,7 +128,7 @@ fn graph_prints_a_dependency_tree() {
 #[test]
 fn graph_json_is_valid_and_lists_nodes() {
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to inspect");
+        skip_required("no id binary to inspect");
         return;
     };
     let out = run(&["graph", "--format", "json", bin]);
@@ -204,7 +197,7 @@ fn pack_deny_gate_fails_when_library_present() {
     // `id` links libc, so `--deny libc.so.6` must fail the pack (a CI policy gate). Uses the
     // daemonless -n -o sink — the policy check runs before staging, so no Docker is needed.
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -235,7 +228,7 @@ fn pack_deny_gate_covers_nss_modules() {
     // resolved dependency graph. The gate must still catch it (regression for the split
     // between resolution.libs and the default-includes).
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -272,7 +265,7 @@ fn tree_has(root: &std::path::Path, name: &str) -> bool {
 fn unpack_round_trips_an_oci_archive() {
     // Pack daemonlessly to an OCI archive, then unpack it and confirm the rootfs is back.
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -305,7 +298,7 @@ fn unpack_round_trips_an_oci_archive() {
 fn pack_oci_archive_writes_the_file() {
     // Exercises the `--oci-archive` sink through the CLI (daemonless — no Docker needed).
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -331,7 +324,7 @@ fn pack_nss_files_only_through_the_cli() {
     // Exercises `--nss` from the command line (the CLI-supplied selection path in dispatch)
     // via the daemonless -n -o sink — no Docker needed.
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -358,7 +351,7 @@ fn pack_nss_files_only_through_the_cli() {
 #[test]
 fn profile_selects_options_and_reports_unknown() {
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -440,7 +433,7 @@ fn profile_sign_without_a_push_target_errors() {
 #[test]
 fn cli_delivery_sink_beats_a_config_push_target() {
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -504,5 +497,202 @@ fn config_smoke_with_no_build_fails_loud() {
     assert!(
         stderr.contains("smoke") && stderr.contains("no-build"),
         "got: {stderr}"
+    );
+}
+
+#[test]
+fn a_label_without_an_equals_sign_warns_but_still_packs() {
+    // The deprecation contract: the old shape keeps working, the warning goes to stderr, and
+    // the exit code does not move. Run through the CLI because the warning is an eprintln!,
+    // not a report field. The OCI-archive sink needs no Docker.
+    let Some(bin) = small_fixture() else {
+        skip_required("no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("img.tar");
+    let out = run(&[
+        "pack",
+        "--label",
+        "build",
+        "--oci-archive",
+        archive.to_str().unwrap(),
+        bin,
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "pack should still succeed: {stderr}");
+    assert!(archive.exists(), "archive not written");
+    assert!(
+        stderr.contains("a label with no `=` is deprecated")
+            && stderr.contains("`build` lands with an empty value"),
+        "label deprecation warning missing from stderr: {stderr}"
+    );
+}
+
+#[test]
+fn an_env_entry_without_an_equals_sign_warns_but_still_packs() {
+    let Some(bin) = small_fixture() else {
+        skip_required("no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("img.tar");
+    let out = run(&[
+        "pack",
+        "--env",
+        "LOG_LEVEL",
+        "--oci-archive",
+        archive.to_str().unwrap(),
+        bin,
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "pack should still succeed: {stderr}");
+    assert!(
+        stderr.contains("an env entry with no `=` is deprecated")
+            && stderr.contains("`LOG_LEVEL` is not KEY=VALUE"),
+        "env deprecation warning missing from stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_label_with_an_equals_sign_is_quiet() {
+    // The warning must not fire on the shape we are steering people towards, including the
+    // deliberate empty value `build=`.
+    let Some(bin) = small_fixture() else {
+        skip_required("no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("img.tar");
+    let out = run(&[
+        "pack",
+        "--label",
+        "build=ci",
+        "--label",
+        "empty=",
+        "--env",
+        "LOG_LEVEL=info",
+        "--oci-archive",
+        archive.to_str().unwrap(),
+        bin,
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "pack should succeed: {stderr}");
+    assert!(
+        !stderr.contains("is deprecated"),
+        "a well-formed pair must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn a_nested_profile_warns_but_still_packs() {
+    // [profile.a.profile.b] parses and is then dropped, so the keys inside never apply.
+    // Warn, keep packing, leave the exit code alone.
+    let Some(bin) = small_fixture() else {
+        skip_required("no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("scratchsmith.toml");
+    std::fs::write(
+        &cfg,
+        format!("binary = \"{bin}\"\n\n[profile.release]\nstrip = true\n\n[profile.release.profile.signed]\nstrip = false\n"),
+    )
+    .unwrap();
+    let rootfs = tmp.path().join("rootfs");
+    let out = run(&[
+        "pack",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--profile",
+        "release",
+        "--no-build",
+        "-o",
+        rootfs.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "pack should still succeed: {stderr}");
+    assert!(
+        stderr.contains("a nested profile is deprecated")
+            && stderr.contains("under [profile.release]"),
+        "nested-profile warning missing from stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_bare_label_warns_on_the_rootfs_sink_too() {
+    // The rootfs sink builds no image, so an earlier placement inside the image path missed it
+    // entirely. `--label` carries no conflicts_with for --no-build, so this invocation is valid
+    // and the user is exactly the one 2.0 would break without notice.
+    let Some(bin) = small_fixture() else {
+        skip_required("no id binary to pack");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs");
+    let out = run(&[
+        "pack",
+        "--label",
+        "build",
+        "--label",
+        "build",
+        "--env",
+        "PATH",
+        "--no-build",
+        "-o",
+        rootfs.to_str().unwrap(),
+        bin,
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "pack should still succeed: {stderr}");
+    assert!(
+        stderr.matches("`build` lands with an empty value").count() == 1,
+        "a repeated entry must warn exactly once: {stderr}"
+    );
+    assert!(
+        stderr.contains("replaces the image's default PATH"),
+        "a bare PATH must say what it replaces: {stderr}"
+    );
+    // The `latest/` segment is the whole point: mike versions the site, so the bare path 404s.
+    assert!(
+        stderr.contains("https://schubydoo.github.io/scratchsmith/latest/deprecations/"),
+        "the warning must point at the versioned Deprecations page: {stderr}"
+    );
+}
+
+#[test]
+fn a_registry_command_without_a_ca_store_fails_instead_of_panicking() {
+    // oci-client's `Client::new` swallows the builder error and falls back to
+    // `Client::default()`, whose `reqwest::Client::default()` panics on the very failure it
+    // just caught. On a host with no CA trust store — most minimal containers, and every
+    // FROM scratch image — `index` died with no message at all: 101 from a dynamic build,
+    // 139 (SIGSEGV) from the shipped musl-static one.
+    //
+    // Hermetic: the client is built before any network call, so this needs no registry.
+    // An empty bundle is how rustls reports "no roots" without unplugging the host's.
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_bundle = tmp.path().join("empty.pem");
+    std::fs::write(&empty_bundle, "").unwrap();
+    let empty_dir = tmp.path().join("certs");
+    std::fs::create_dir(&empty_dir).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scratchsmith"))
+        .args(["index", "ghcr.io/x/y:1", "ghcr.io/x/y:1-amd64"])
+        .env("SSL_CERT_FILE", &empty_bundle)
+        .env("SSL_CERT_DIR", &empty_dir)
+        .output()
+        .expect("failed to run scratchsmith binary");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A signal death has no code at all, which is the shape of the original bug.
+    let code = out.status.code().unwrap_or_else(|| {
+        panic!("killed by a signal rather than exiting; stderr: {stderr}");
+    });
+    assert_eq!(code, 1, "expected a plain failure exit: {stderr}");
+    assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+    assert!(
+        stderr.contains("building the registry client for ghcr.io")
+            && stderr.contains("no trust store"),
+        "the error must name the cause and the fix: {stderr}"
     );
 }

@@ -1,7 +1,6 @@
 //! Stage a resolved binary into a rootfs: place the loader, libraries, and binary
 //! at the paths the runtime expects, recreate soname symlinks, and regenerate the
 //! loader cache. Consumes the [`Resolution`] produced by [`crate::resolver`].
-//! See Tasks 1.4-1.5.
 
 use crate::resolver::Resolution;
 use anyhow::{bail, Context, Result};
@@ -19,9 +18,9 @@ pub struct StagedTree {
     pub entrypoint: PathBuf,
 }
 
-/// Optional runtime files a user can inject (Task 4.5). Unlike the always-on NSS
-/// includes, these are opt-in, and an explicit request that can't be satisfied is an
-/// error (the user asked for it), not a warning.
+/// Optional runtime files a user can inject. Unlike the always-on NSS includes, these
+/// are opt-in, and an explicit request that can't be satisfied is an error (the user
+/// asked for it), not a warning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuntimeExtras {
     /// TLS CA bundle at /etc/ssl/certs/ca-certificates.crt.
@@ -214,8 +213,10 @@ pub fn stage_added_files(dest: &Path, files: &[AddFile], mode: SymlinkMode) -> R
                     continue;
                 }
                 // CopyUnsafe with an unsafe target falls through to the copy below, which is
-                // exactly what the mode name promises.
-                _ => {}
+                // what the mode name promises. CopyAll never reaches this match (line 178
+                // gates on it) and is named only for exhaustiveness, so a new SymlinkMode is
+                // a compile error here instead of a silent copy.
+                SymlinkMode::CopyAll | SymlinkMode::CopyUnsafe => {}
             }
         }
 
@@ -579,9 +580,9 @@ services:       files
 }
 
 // A `passwd: files` nsswitch is a lie without a passwd database, and binaries that
-// call getpwuid() at startup (to find $HOME) get a null and may misbehave. Ship a
-// minimal one, matching dockerize2's template. The non-root default user (Task 2.3)
-// will extend this later.
+// call getpwuid() at startup (to find $HOME) get a null and can misbehave. Ship a
+// minimal one. `nonroot` at 65532 is the image's default user, so it has to resolve
+// here or the default pack ships a user with no passwd entry.
 const MINIMAL_PASSWD: &str = "\
 root:x:0:0:root:/root:/sbin/nologin
 nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin
@@ -610,7 +611,7 @@ pub fn stage(
 /// user lookups work: a minimal nsswitch.conf, the NSS modules (version-matched to
 /// the staged libc), and — when `files` is staged — a minimal passwd/group. `nss`
 /// selects which modules and nsswitch sources are staged (`--nss`). Missing NSS modules
-/// become warnings, not errors. TLS CA certs are a separate opt-in (`--ca-certs`, Task 4.5).
+/// become warnings, not errors. TLS CA certs are a separate opt-in (`--ca-certs`).
 pub fn stage_default_includes(
     resolution: &Resolution,
     dest: &Path,
@@ -758,32 +759,29 @@ pub fn strip_and_measure(
 }
 
 fn run_strip(path: &Path) -> Result<()> {
-    let out = Command::new("strip")
-        .arg("--strip-unneeded")
-        .arg(path)
-        .output()
-        .context("running strip (install binutils?)")?;
-    if !out.status.success() {
-        bail!(
-            "strip failed on {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
+    run_in_place("strip", "--strip-unneeded", path, "install binutils?")
 }
 
 // Compress an executable in place with UPX (`--best` for ratio). UPX is absent on many
 // hosts, so a spawn failure is surfaced as a clear, actionable error, not a panic.
 fn run_upx(path: &Path) -> Result<()> {
-    let out = Command::new("upx")
-        .arg("--best")
+    run_in_place("upx", "--best", path, "install upx?")
+}
+
+/// Run `program flag path`, rewriting the file in place, and fail loudly either way.
+///
+/// Both tools are absent on many hosts, so a spawn failure carries `hint` rather than a bare
+/// "No such file or directory", and a non-zero exit carries the tool's own stderr rather than
+/// a panic. The two call sites differ only in the program, the flag and that hint.
+fn run_in_place(program: &str, flag: &str, path: &Path, hint: &str) -> Result<()> {
+    let out = Command::new(program)
+        .arg(flag)
         .arg(path)
         .output()
-        .context("running upx (install upx?)")?;
+        .with_context(|| format!("running {program} ({hint})"))?;
     if !out.status.success() {
         bail!(
-            "upx failed on {}: {}",
+            "{program} failed on {}: {}",
             path.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );

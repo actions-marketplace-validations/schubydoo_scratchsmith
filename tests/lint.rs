@@ -4,14 +4,8 @@
 use scratchsmith::lint::{analyze, Relro};
 use std::path::Path;
 use std::process::Command;
-
-fn cc_available() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+mod common;
+use common::{cc_available, skip_required};
 
 fn compile(dir: &Path, name: &str, extra: &[&str]) -> std::path::PathBuf {
     let src = dir.join("m.c");
@@ -40,7 +34,7 @@ fn compile(dir: &Path, name: &str, extra: &[&str]) -> std::path::PathBuf {
 #[test]
 fn hardened_binary_reports_all_mitigations() {
     if !cc_available() {
-        eprintln!("skipping: no C compiler");
+        skip_required("no C compiler");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -67,7 +61,7 @@ fn hardened_binary_reports_all_mitigations() {
 #[test]
 fn unhardened_binary_reports_missing_mitigations() {
     if !cc_available() {
-        eprintln!("skipping: no C compiler");
+        skip_required("no C compiler");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -93,7 +87,7 @@ fn unhardened_binary_reports_missing_mitigations() {
 #[test]
 fn fail_on_gate_controls_the_exit_code() {
     if !cc_available() {
-        eprintln!("skipping: no C compiler");
+        skip_required("no C compiler");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

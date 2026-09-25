@@ -1,6 +1,6 @@
 //! Assemble the staged rootfs into a container image. Sinks: the local Docker daemon
-//! via a docker-archive tarball (Task 1.6), and a daemonless **OCI archive** (Task 5.1).
-//! Registry push (5.2) is next. Layers are reproducible (2.9).
+//! via a docker-archive tarball, a daemonless **OCI archive**, and a direct registry
+//! push. Layers are reproducible.
 
 use crate::stager::StagedTree;
 use anyhow::{bail, Context, Result};
@@ -9,8 +9,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-/// User-configurable image metadata (Task 2.2). Empty fields fall back to defaults:
-/// the entrypoint defaults to the packed binary, and PATH is always present.
+/// User-configurable image metadata. Empty fields fall back to defaults: the entrypoint
+/// defaults to the packed binary, and PATH is always present.
 #[derive(Debug, Clone, Default)]
 pub struct ImageConfig {
     /// Overrides the default entrypoint (the packed binary) when non-empty.
@@ -71,7 +71,7 @@ pub fn load_into_docker(
 }
 
 /// Write an **OCI image-layout** tarball (`oci-layout` + `index.json` + `blobs/sha256/*`)
-/// with no Docker daemon — Task 5.1. `skopeo`, `buildah`, and OCI-aware tooling read this
+/// with no Docker daemon. `skopeo`, `buildah`, and OCI-aware tooling read this
 /// shape (as does `docker load` where the containerd image store is enabled). The config
 /// and layer blobs are the exact same bytes the docker sink uses — so the image ID is
 /// identical across sinks; the OCI manifest/index here are new artifacts this path adds.
@@ -115,8 +115,15 @@ pub fn write_oci_archive(
     Ok(())
 }
 
-const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+// Crate-visible, for the four `registry` sites that spell the same strings. Only one of them
+// EMITS: `build_index` writes OCI_INDEX into the index it pushes. The other three describe what
+// a remote registry may send — the Accept list for a manifest pull, and the fallback for a
+// manifest that omits `mediaType`. Both halves are fixed by the OCI spec, so sharing one
+// constant is safe; if we ever emit something else, split the emit constant from the accept
+// list rather than changing this one. The tests keep their own literals on purpose, because a
+// test comparing a constant against itself proves nothing.
+pub(crate) const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+pub(crate) const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 const OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
@@ -134,7 +141,7 @@ fn blob_path(digest_hex: &str) -> String {
 }
 
 /// The reusable pieces of a built image — the layer plus the config blob — shared by
-/// every sink (docker-archive, OCI archive, later registry push). Building it once keeps
+/// every sink (docker-archive, OCI archive, registry push). Building it once keeps
 /// the digests byte-identical across sinks.
 pub(crate) struct BuiltImage {
     pub(crate) layer: Layer,
@@ -177,19 +184,21 @@ fn write_docker_archive(built: &BuiltImage, tag: &str, out: &Path) -> Result<()>
 }
 
 /// A built image layer: the gzip bytes, plus the two hashes that must stay distinct.
-pub struct Layer {
+///
+/// `pub(crate)`, matching `BuiltImage` above: nothing outside this module builds a layer.
+pub(crate) struct Layer {
     /// gzip-compressed layer tar (what goes in the archive / is pushed).
-    pub gzip: Vec<u8>,
+    pub(crate) gzip: Vec<u8>,
     /// sha256 of the UNCOMPRESSED tar — the config's `rootfs.diff_ids` entry.
-    pub diff_id: String,
+    pub(crate) diff_id: String,
     /// sha256 of the GZIP blob — the manifest's `layers[].digest`.
-    pub digest: String,
+    pub(crate) digest: String,
 }
 
 /// Build a reproducible, gzipped layer from the staged rootfs. The diff_id (from the
 /// uncompressed tar) and the digest (from the gzip) are computed separately —
 /// conflating them is the classic bug that yields unpullable images.
-pub fn build_layer(root: &Path) -> Result<Layer> {
+pub(crate) fn build_layer(root: &Path) -> Result<Layer> {
     let tar_bytes = deterministic_tar(root)?;
     let diff_id = hex(Sha256::digest(&tar_bytes));
     let gzip = gzip(&tar_bytes)?;
@@ -201,30 +210,59 @@ pub fn build_layer(root: &Path) -> Result<Layer> {
     })
 }
 
+// Every path under `root`, sorted, excluding `root` itself.
+//
+// A walk error is PROPAGATED, never skipped. Discarding one drops that entry, or a whole
+// unreadable subtree, from the layer -- and the pack then succeeds, digests and SIGNS a short
+// layer, so the image fails only later, at run time, on a missing library. Failing loud here
+// matches `pack::staged_size` and `diff::scan`, which already propagate.
+fn sorted_entries(root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    // follow_links(false) is the default, but both siblings state it and the tar loop's symlink
+    // handling below depends on it, so pin it where it is relied on.
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|e| {
+            // Name the entry that could not be read, not just the root: walkdir reports the
+            // failing path, and that is the one thing the user can act on.
+            let at = e
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| root.display().to_string());
+            anyhow::Error::new(e).context(format!("reading the staged rootfs entry {at}"))
+        })?;
+        let path = entry.into_path();
+        if path != root {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 // Tar the staged tree reproducibly: entries sorted by path, mtime zeroed, uid/gid 0,
 // canonical modes, symlinks preserved. The same rootfs yields a byte-identical tar.
 fn deterministic_tar(root: &Path) -> Result<Vec<u8>> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mut paths: Vec<std::path::PathBuf> = walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .map(|e| e.into_path())
-        .filter(|p| p != root)
-        .collect();
-    paths.sort();
+    let paths = sorted_entries(root)?;
 
     let mut ar = tar::Builder::new(Vec::new());
     for path in paths {
         let rel = path.strip_prefix(root)?;
-        let meta = std::fs::symlink_metadata(&path)?;
+        // Every read here names its path too. An entry the walk could stat but this process
+        // cannot read (a restrictive mode, or one that vanishes between the walk and the read)
+        // otherwise fails with a bare "Permission denied (os error 13)": loud, but with nothing
+        // to act on. Nothing up the chain adds a path, so it has to be added here.
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("reading the staged rootfs entry {}", path.display()))?;
         let mut header = tar::Header::new_gnu();
         header.set_mtime(0);
         header.set_uid(0);
         header.set_gid(0);
 
         if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&path)?;
+            let target = std::fs::read_link(&path)
+                .with_context(|| format!("reading the staged symlink {}", path.display()))?;
             header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             header.set_mode(0o777);
@@ -235,7 +273,8 @@ fn deterministic_tar(root: &Path) -> Result<Vec<u8>> {
             header.set_mode(0o755);
             ar.append_data(&mut header, rel, std::io::empty())?;
         } else {
-            let data = std::fs::read(&path)?;
+            let data = std::fs::read(&path)
+                .with_context(|| format!("reading the staged file {}", path.display()))?;
             let exec = meta.permissions().mode() & 0o111 != 0;
             header.set_entry_type(tar::EntryType::Regular);
             header.set_size(data.len() as u64);
@@ -259,6 +298,13 @@ fn gzip(data: &[u8]) -> Result<Vec<u8>> {
 const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// Distroless-style non-root uid:gid; the default so images never run as root.
 const DEFAULT_USER: &str = "65532:65532";
+
+/// The published Deprecations page. Every deprecation warning ends with it, so a reader has the
+/// whole list rather than the one line in front of them (`COMPATIBILITY.md:53`).
+/// The `latest/` segment is load-bearing: `mike` writes each build into its own version
+/// directory and leaves only a redirect stub at the site root, so the bare path is a 404
+/// (measured: `/scratchsmith/usage/` 404, `/scratchsmith/latest/usage/` 200).
+pub const DEPRECATIONS_URL: &str = "https://schubydoo.github.io/scratchsmith/latest/deprecations/";
 
 // The host CPU architecture as an OCI/Go `GOARCH` value, for the image config's
 // `architecture` field. Split from the host lookup so every arm is unit-testable.
@@ -331,17 +377,62 @@ fn image_config(default_entrypoint: &Path, diff_id: &str, cfg: &ImageConfig) -> 
     })
 }
 
+/// Warn on a `--label` or `--env` value with no `=`, one line per distinct entry.
+///
+/// A bare name is accepted today: the label lands with an empty value, and the env entry breaks
+/// the `KEY=VALUE` form the OCI image config specifies. 2.0 rejects both, and
+/// `COMPATIBILITY.md:41` wants the warning a major line ahead of the rejection, so the exit code
+/// stays where it is. The values also arrive from the `label` and `env` keys in
+/// `scratchsmith.toml`, which is why the text names the value rather than the flag.
+///
+/// Call this once per run, before staging. It reads the effective config, so it covers every
+/// sink, including `--no-build -o DIR`, which builds no image at all.
+pub fn warn_about_bare_entries(cfg: &ImageConfig) {
+    for entry in distinct_bare(&cfg.labels) {
+        eprintln!(
+            "warning: a label with no `=` is deprecated; `{entry}` lands with an empty value. \
+             Write `{entry}=<value>`. scratchsmith 2.0 rejects it. See {DEPRECATIONS_URL}"
+        );
+    }
+    for entry in distinct_bare(&cfg.env) {
+        // A bare `PATH` is worse than a stray entry: `merged_env` keys on the text before the
+        // first `=`, finds the default PATH and replaces it, so the image ends up with no PATH.
+        let extra = if entry == "PATH" {
+            " It also replaces the image's default PATH, leaving no PATH at all."
+        } else {
+            ""
+        };
+        eprintln!(
+            "warning: an env entry with no `=` is deprecated; `{entry}` is not KEY=VALUE, so a \
+             runtime can drop it.{extra} Write `{entry}=<value>`. scratchsmith 2.0 rejects it. \
+             See {DEPRECATIONS_URL}"
+        );
+    }
+}
+
+/// The entries with no `=`, sorted and deduplicated, so `--label x --label x` warns once.
+fn distinct_bare(entries: &[String]) -> Vec<&str> {
+    let mut bare: Vec<&str> = entries
+        .iter()
+        .map(String::as_str)
+        .filter(|e| !e.contains('='))
+        .collect();
+    bare.sort_unstable();
+    bare.dedup();
+    bare
+}
+
 /// True when an image user string denotes root (uid 0 or `root`), so the caller can
 /// warn. Accepts the `uid`, `uid:gid`, and name forms.
 pub fn is_root_user(user: &str) -> bool {
-    let uid = user.split(':').next().unwrap_or(user);
+    let uid = user.split_once(':').map_or(user, |(uid, _)| uid);
     uid == "0" || uid == "root"
 }
 
 // Start from the default PATH, then apply user env entries, overriding by key so a
 // user-supplied PATH replaces the default rather than duplicating it.
 fn merged_env(user: &[String]) -> Vec<String> {
-    let key_of = |e: &str| e.split('=').next().unwrap_or(e).to_string();
+    let key_of = |e: &str| e.split_once('=').map_or(e, |(key, _)| key).to_string();
     let mut env = vec![DEFAULT_PATH.to_string()];
     for entry in user {
         let key = key_of(entry);
@@ -422,7 +513,11 @@ fn append_bytes<W: Write>(ar: &mut tar::Builder<W>, name: &str, data: &[u8]) -> 
     Ok(())
 }
 
-fn hex(digest: impl AsRef<[u8]>) -> String {
+/// Lowercase hex, the form an OCI digest takes after `sha256:`.
+///
+/// One copy on purpose: `diff` and `unpack` both compare digests this produces against digests
+/// this produces, so two implementations that drift would report every layer as changed.
+pub(crate) fn hex(digest: impl AsRef<[u8]>) -> String {
     use std::fmt::Write as _;
     digest.as_ref().iter().fold(String::new(), |mut s, b| {
         let _ = write!(s, "{b:02x}");
@@ -452,6 +547,70 @@ mod tests {
         // diff_id is the uncompressed hash, digest the gzip hash — never equal.
         assert_ne!(layer.diff_id, layer.digest);
         assert!(!layer.gzip.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_entry_fails_the_layer_instead_of_dropping_it() {
+        // The layer tar USED to `filter_map(|e| e.ok())` the walk, so an unreadable directory
+        // vanished from the image and the pack still succeeded -- then digested and signed a
+        // short layer. Assert the loud failure, and that the message names the path.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tiny_rootfs();
+        let root = tmp.path().join("root");
+        let locked = root.join("usr/lib/private");
+        std::fs::create_dir_all(locked.join("deeper")).unwrap();
+        std::fs::write(locked.join("deeper/secret.so"), b"payload").unwrap();
+
+        // Sanity: it builds fine while the subtree is readable, so the failure below is the
+        // permission and nothing else.
+        build_layer(&root).expect("a readable rootfs must build");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Test the PRECONDITION rather than infer it from a uid: root ignores the mode bits,
+        // and so do some container and filesystem setups. If the directory is still readable
+        // this test cannot fail, and a test that cannot fail must say so rather than pass.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            panic!(
+                "cannot make {} unreadable (running as root?), so this test proves nothing",
+                locked.display()
+            );
+        }
+        // Matched rather than `expect_err`, which would need `Layer: Debug` — and deriving it
+        // on a struct holding the gzip bytes would dump a whole layer into a failure message.
+        let built = build_layer(&root);
+
+        // Restore before any assertion, so a failing assert still lets TempDir clean up.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let Err(err) = built else {
+            panic!("an unreadable subtree must fail the layer, but it built one");
+        };
+        let msg = format!("{err:#}");
+
+        // Assert the FULL path, not a substring of it: the property under test is that the
+        // failing ENTRY is named rather than the root, and a loose substring could be satisfied
+        // by some other path under the temp tree.
+        assert!(
+            msg.contains(&locked.display().to_string()),
+            "the error must name the entry that could not be read ({}), got: {msg}",
+            locked.display()
+        );
+    }
+
+    #[test]
+    fn an_unopenable_root_fails_instead_of_building_an_empty_layer() {
+        // The WORSE half of the same bug, and the one the subtree test above does not reach.
+        // With the old `filter_map(|e| e.ok())` an unopenable root yielded an EMPTY path list,
+        // so build_layer returned a valid-looking empty layer. A short layer at least fails at
+        // container start on a missing library; an empty one builds an image that pulls,
+        // starts, and contains nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("no-such-root");
+        assert!(
+            build_layer(&gone).is_err(),
+            "an absent root must fail, not build an empty layer"
+        );
     }
 
     #[test]

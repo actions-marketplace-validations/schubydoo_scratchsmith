@@ -1,8 +1,11 @@
 //! Resolve a binary's shared-library deps by emulating the `ld.so` search order
-//! (not by scraping host `ldd`). The correctness core; see Tasks 1.2-1.3.
+//! (not by scraping host `ldd`). The correctness core.
 //!
-//! This file covers Task 1.2: read the raw dynamic-linking facts from an ELF. The
-//! search-order emulation that turns sonames into real paths lands in Task 1.3.
+//! Two halves, both here: `parse_elf_info` reads the raw dynamic-linking facts out of an
+//! ELF, and `resolve_with` turns each soname into a real path by searching DT_RPATH (the
+//! object's own, then its ancestors' — RPATH is transitive, and ignored when the object
+//! also declares RUNPATH), then its own DT_RUNPATH, then the sysroot default dirs.
+//! `$ORIGIN`, `$LIB` and `$PLATFORM` are expanded inside those entries, not searched.
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashSet, VecDeque};
@@ -21,7 +24,7 @@ pub enum Linking {
 ///
 /// RPATH and RUNPATH are kept separate on purpose: they differ in search
 /// precedence and scope, and conflating them is the classic resolution bug —
-/// RUNPATH is not inherited by a library's own dependencies (see Task 1.3).
+/// RUNPATH is not inherited by a library's own dependencies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElfInfo {
     /// Program interpreter (PT_INTERP) — the dynamic loader. Absent for static
@@ -40,8 +43,8 @@ pub struct ElfInfo {
     pub is_64: bool,
     /// ELF machine (`e_machine`). Drives `$PLATFORM` and the default lib triplet.
     pub machine: u16,
-    /// References `dlopen`/`dlsym` — its runtime plugins are NOT in the dependency
-    /// graph, so resolution may be incomplete (the user may need `--include`).
+    /// References `dlopen` or `dlmopen` — its runtime plugins are NOT in the dependency
+    /// graph, so resolution can be incomplete (the user may need `--include`).
     pub uses_dlopen: bool,
 }
 
@@ -110,8 +113,8 @@ pub fn parse_elf_info(bytes: &[u8]) -> Result<ElfInfo> {
     })
 }
 
-// A binary that calls dlopen imports the symbol, so its presence in the dynamic
-// symbols means runtime plugin loading the static graph can't see.
+// A binary that calls dlopen imports the symbol, so finding it among the dynamic symbols
+// means the binary loads plugins at run time, which the static graph cannot see.
 fn references_dlopen(elf: &goblin::elf::Elf) -> bool {
     elf.dynsyms
         .iter()
@@ -120,7 +123,7 @@ fn references_dlopen(elf: &goblin::elf::Elf) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Task 1.3: emulate the ld.so search order.
+// Emulate the ld.so search order.
 // ---------------------------------------------------------------------------
 
 /// A pinned root filesystem to resolve against, plus the loader's default search
@@ -216,15 +219,35 @@ impl Resolution {
 /// Supplies the dynamic-linking facts for a file. Abstracted so the search order
 /// can be tested against scripted dependency graphs without building real ELFs.
 pub trait LinkInfoSource {
-    fn read(&self, path: &Path) -> Result<ElfInfo>;
+    /// The dynamic-linking facts for `path`.
+    ///
+    /// The two failure shapes are deliberately DIFFERENT types, because conflating them
+    /// drops a whole subtree from the resolution, with nothing landing in `missing`:
+    ///
+    /// - `Ok(None)` — the file was read, and it is not an ELF (a stray data file resolved by
+    ///   name). It has no `DT_NEEDED` of its own, so keeping it as a leaf is correct.
+    /// - `Err` — the file could not be READ. Nothing is known about its dependencies, so
+    ///   treating it as a leaf would drop its whole subtree from the resolution without
+    ///   anything landing in `Resolution::missing`.
+    fn read(&self, path: &Path) -> Result<Option<ElfInfo>>;
 }
 
 /// The production source: parse the real file with goblin.
 pub struct GoblinSource;
 
 impl LinkInfoSource for GoblinSource {
-    fn read(&self, path: &Path) -> Result<ElfInfo> {
-        read_elf_info(path)
+    fn read(&self, path: &Path) -> Result<Option<ElfInfo>> {
+        // The IO error propagates; a PARSE failure stays a leaf, exactly as before.
+        //
+        // Keying the leaf on the `\x7fELF` magic instead -- so a truncated or corrupt `.so`
+        // propagates -- is a real improvement and is NOT done here. It would refuse to pack a
+        // graph that packs today: such a file survives the stager's copy, the hardening lint
+        // returns Option, and only `--strip` rejects it, so a default pack exited 0 and wrote
+        // an image. That is "tighten validation", which is a separate decision from this fix.
+        // Tracked in the scratch backlog beside DEF F12, which was split out for the same
+        // property.
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(parse_elf_info(&bytes).ok())
     }
 }
 
@@ -253,7 +276,9 @@ pub fn resolve_with(
 ) -> Result<Resolution> {
     let root_path =
         std::fs::canonicalize(binary).with_context(|| format!("locating {}", binary.display()))?;
-    let mut root_info = source.read(&root_path)?;
+    let mut root_info = source
+        .read(&root_path)?
+        .ok_or_else(|| anyhow::anyhow!("{} is not a valid ELF binary", root_path.display()))?;
     // Treat --include entries as extra direct dependencies of the binary, so they and
     // their own transitive deps are resolved and staged like anything else.
     root_info.needed.extend(includes.iter().cloned());
@@ -330,9 +355,18 @@ pub fn resolve_with(
                 soname: soname.clone(),
                 path: real.clone(),
             });
-            // A resolved file that will not parse (e.g. a stray data file) is kept
-            // as a leaf rather than aborting the whole resolution.
-            if let Ok(child) = source.read(&real) {
+            // A resolved file that will not PARSE (e.g. a stray data file) is kept as a leaf
+            // rather than aborting the whole resolution. A file that cannot be READ is not:
+            // its own DT_NEEDED children are never queued, never resolved and never staged,
+            // and they never reach `missing` either, because nothing asked for them.
+            //
+            // What the user saw depended on the command. `graph` resolves without staging, so
+            // it exited 0 and reported a tree with a whole branch absent. `pack` did fail, but
+            // only later and for the wrong reason: the library is pushed to `resolution.libs`
+            // just above, and the stager's copy of that same unreadable file failed, so the
+            // error named a copy. `check_lib_policy` runs after `stager::stage`, so the
+            // --require/--deny gate was never reached rather than blind.
+            if let Some(child) = source.read(&real)? {
                 queue.push_back((real, child, child_rpaths.clone()));
             }
         }
@@ -407,7 +441,8 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn push_unique(v: &mut Vec<String>, item: String) {
+/// Append `item` to `v` unless already present. A parent can list a soname twice.
+pub(crate) fn push_unique(v: &mut Vec<String>, item: String) {
     if !v.contains(&item) {
         v.push(item);
     }
@@ -487,7 +522,7 @@ mod tests {
         assert!(ensure_glibc(&glibc).is_ok());
     }
 
-    // --- Task 1.3: ld.so search-order emulation --------------------------------
+    // --- ld.so search-order emulation ------------------------------------------
     // These drive the search logic through a scripted dependency graph so we can
     // exercise RPATH/RUNPATH/$ORIGIN precisely without building real ELF files.
 
@@ -499,12 +534,10 @@ mod tests {
     }
 
     impl LinkInfoSource for MapSource {
-        fn read(&self, path: &Path) -> Result<ElfInfo> {
-            let key = canonical(path);
-            self.infos
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("no scripted info for {}", key.display()))
+        // A path with no scripted entry is a LEAF, not a read failure. That is what these
+        // fixtures always meant; it used to be spelled as an `Err` that the resolver swallowed.
+        fn read(&self, path: &Path) -> Result<Option<ElfInfo>> {
+            Ok(self.infos.get(&canonical(path)).cloned())
         }
     }
 
@@ -528,6 +561,114 @@ mod tests {
 
     fn has(res: &Resolution, soname: &str) -> bool {
         res.libs.iter().any(|l| l.soname == soname)
+    }
+
+    // A source that READS every scripted path but fails on one, to separate the two shapes
+    // the resolver must treat differently.
+    struct FailingSource {
+        infos: HashMap<PathBuf, ElfInfo>,
+        unreadable: PathBuf,
+    }
+
+    impl LinkInfoSource for FailingSource {
+        fn read(&self, path: &Path) -> Result<Option<ElfInfo>> {
+            let key = canonical(path);
+            if key == canonical(&self.unreadable) {
+                anyhow::bail!("simulated IO failure reading {}", key.display());
+            }
+            Ok(self.infos.get(&key).cloned())
+        }
+    }
+
+    // Graph shared by the two tests below: exe -> libmid -> libleaf, all resolvable.
+    fn chain_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf, HashMap<PathBuf, ElfInfo>) {
+        let loader = root.join("lib64/ld-linux-x86-64.so.2");
+        let exe = root.join("app/exe");
+        let mid = root.join("app/libs/libmid.so");
+        let leaf = root.join("app/libs/libleaf.so");
+        for p in [&loader, &exe, &mid, &leaf] {
+            touch(p);
+        }
+        let mut infos = HashMap::new();
+        infos.insert(
+            canonical(&exe),
+            elf(
+                &["libmid.so"],
+                &["$ORIGIN/libs"],
+                &[],
+                Some("/lib64/ld-linux-x86-64.so.2"),
+            ),
+        );
+        infos.insert(canonical(&mid), elf(&["libleaf.so"], &[], &[], None));
+        infos.insert(canonical(&leaf), elf(&[], &[], &[], None));
+        (exe, mid, leaf, infos)
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_read_fails_the_resolution() {
+        // libmid resolves and is staged, but cannot be READ. Swallowing that used to leave
+        // libmid in `libs` while libleaf -- its only DT_NEEDED -- was never queued, never
+        // resolved and never staged, and never reached `missing` either, because nothing ever
+        // asked for it. `graph` then exited 0 reporting a tree with that branch absent, and
+        // `pack` failed only later, at the stager's copy of the same file, naming a copy
+        // rather than the read.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (exe, mid, leaf, infos) = chain_fixture(root);
+        let sysroot = Sysroot::new(root);
+
+        let src = FailingSource {
+            infos,
+            unreadable: mid.clone(),
+        };
+        let err = match resolve_with(&exe, &sysroot, &[], &src) {
+            Ok(res) => panic!(
+                "an unreadable library must fail the resolution, but it returned {} libs \
+                 and missing={:?} (libleaf present: {})",
+                res.libs.len(),
+                res.missing,
+                has(&res, "libleaf.so")
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains(&mid.display().to_string()),
+            "the error must name the library that could not be read ({}), got: {err}",
+            mid.display()
+        );
+        // Guard the fixture itself: libleaf must be reachable, so the failure above is the
+        // simulated read and not an unresolvable graph.
+        let ok = resolve_with(
+            &exe,
+            &sysroot,
+            &[],
+            &MapSource {
+                infos: chain_fixture(root).3,
+            },
+        )
+        .unwrap();
+        assert!(has(&ok, "libleaf.so"), "fixture must resolve {leaf:?}");
+    }
+
+    #[test]
+    fn a_resolved_file_that_is_not_an_elf_stays_a_leaf() {
+        // The other half, and the behavior the old code was reaching for: a file that READS
+        // fine and simply is not an ELF has no DT_NEEDED of its own, so it is staged as a
+        // leaf and the resolution continues.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (exe, mid, _leaf, mut infos) = chain_fixture(root);
+        // Drop libmid's scripted info: MapSource returns Ok(None) for it, which is exactly
+        // "read fine, not an ELF".
+        infos.remove(&canonical(&mid));
+
+        let res = resolve_with(&exe, &Sysroot::new(root), &[], &MapSource { infos })
+            .expect("a non-ELF leaf must not fail the resolution");
+        assert!(has(&res, "libmid.so"), "the leaf itself must still stage");
+        assert!(
+            !has(&res, "libleaf.so"),
+            "a leaf contributes no DT_NEEDED children"
+        );
     }
 
     #[test]

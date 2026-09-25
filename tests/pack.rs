@@ -8,6 +8,12 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
+mod common;
+use common::{
+    docker_available, grype_available, skip_optional, skip_required, small_fixture, syft_available,
+    upx_available,
+};
+
 // Docker tests pack the same binary into the same derived tag, so they must not run
 // concurrently or one test's cleanup deletes another's image. Serialize them.
 static DOCKER: Mutex<()> = Mutex::new(());
@@ -16,40 +22,8 @@ fn docker_lock() -> std::sync::MutexGuard<'static, ()> {
     DOCKER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn docker_available() -> bool {
-    Command::new("docker")
-        .arg("info")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 fn rmi(tag: &str) {
     let _ = Command::new("docker").args(["rmi", "-f", tag]).output();
-}
-
-fn syft_available() -> bool {
-    Command::new("syft")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn upx_available() -> bool {
-    Command::new("upx")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn grype_available() -> bool {
-    Command::new("grype")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 fn find_tini_exists() -> bool {
@@ -61,20 +35,6 @@ fn find_tini_exists() -> bool {
     ]
     .iter()
     .any(|p| Path::new(p).exists())
-}
-
-// A small dynamic-glibc system binary for the docker/registry tests that don't need to
-// dogfood scratchsmith itself. Packing the 40 MB debug binary dominates their runtime;
-// `id` is tiny, dynamically linked against glibc, exercises the NSS staging, and prints a
-// checkable `uid=`. Returns None when absent so callers skip gracefully (parity with the
-// getent/tini optional-tool tests) rather than panicking on a minimal host. The one dogfood
-// test (packs_a_binary_that_runs_in_docker) still packs scratchsmith to prove the real
-// binary works.
-fn small_fixture() -> Option<&'static Path> {
-    ["/usr/bin/id", "/bin/id"]
-        .into_iter()
-        .map(Path::new)
-        .find(|p| p.exists())
 }
 
 #[test]
@@ -135,7 +95,7 @@ fn max_size_gate_fails_when_over_and_passes_when_under() {
     // The -n -o path needs no Docker: it stages + measures, then the size gate runs.
     let bin = env!("CARGO_BIN_EXE_scratchsmith");
     let Some(fixture) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let packed = fixture.to_str().unwrap();
@@ -204,7 +164,7 @@ fn add_file_copies_host_files_into_the_rootfs() {
     // The -n -o path needs no Docker: --add-file copies land beside the staged libs.
     let bin = env!("CARGO_BIN_EXE_scratchsmith");
     let Some(fixture) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let packed = fixture.to_str().unwrap();
@@ -274,7 +234,7 @@ fn symlinks_preserve_puts_the_named_binary_path_back() {
     // path the user typed is gone from the image. --symlinks puts it back as a link.
     let bin = env!("CARGO_BIN_EXE_scratchsmith");
     let Some(fixture) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -344,7 +304,7 @@ fn the_report_names_the_loader_the_image_carries() {
     // that does not name it leaves the one host-dependent path in the image unrecorded.
     let bin = env!("CARGO_BIN_EXE_scratchsmith");
     let Some(fixture) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -404,11 +364,11 @@ fn locale_stages_one_locale_and_never_the_archive() {
     // under /usr/lib/locale, and the host's locale-archive must stay out of the image.
     let bin = env!("CARGO_BIN_EXE_scratchsmith");
     let Some(fixture) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let Some(locale) = stageable_locale() else {
-        eprintln!("skipping: host has no locale directory and no localedef sources");
+        skip_optional("host has no locale directory and no localedef sources");
         return;
     };
     let packed = fixture.to_str().unwrap();
@@ -471,11 +431,11 @@ fn locale_stages_one_locale_and_never_the_archive() {
 #[test]
 fn init_wraps_the_entrypoint_with_tini_and_still_runs() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
     if !Path::new("/usr/bin/tini").exists() {
-        eprintln!("skipping: no tini");
+        skip_optional("no tini");
         return;
     }
     let _g = docker_lock();
@@ -514,7 +474,7 @@ fn init_wraps_the_entrypoint_with_tini_and_still_runs() {
 fn init_without_tini_fails_clearly() {
     // Only meaningful where tini is absent; --init must fail loud, not silently skip.
     if find_tini_exists() {
-        eprintln!("skipping: tini is installed");
+        skip_optional("tini is installed");
         return;
     }
     let bin = Path::new(env!("CARGO_BIN_EXE_scratchsmith"));
@@ -560,7 +520,7 @@ fn stage_only_writes_a_rootfs_without_docker() {
 #[test]
 fn packs_a_binary_that_runs_in_docker() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
     let _g = docker_lock();
@@ -597,12 +557,16 @@ fn packs_a_binary_that_runs_in_docker() {
 
 #[test]
 fn upx_packed_image_smoke_runs() {
-    if !docker_available() || !upx_available() {
-        eprintln!("skipping upx_packed_image_smoke_runs: no docker or no upx");
+    if !docker_available() {
+        skip_required("no Docker daemon");
+        return;
+    }
+    if !upx_available() {
+        skip_required("no upx");
         return;
     }
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping upx_packed_image_smoke_runs: no small fixture");
+        skip_required("no id binary to pack");
         return;
     };
     let _g = docker_lock();
@@ -622,12 +586,12 @@ fn upx_packed_image_smoke_runs() {
 #[test]
 fn image_config_is_reflected_in_docker_inspect() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
     let _g = docker_lock();
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let cfg = ImageConfig {
@@ -660,7 +624,7 @@ fn image_config_is_reflected_in_docker_inspect() {
     assert!(inspect("{{json .Config.Env}}").contains("FOO=bar"));
     assert!(inspect("{{json .Config.Cmd}}").contains("--version"));
     assert!(inspect("{{.Config.WorkingDir}}").contains("/work"));
-    // Non-root by default (Task 2.3).
+    // Non-root by default.
     assert!(inspect("{{.Config.User}}").contains("65532"));
     // Labels + healthcheck (exec form) reach the image config.
     assert!(inspect("{{index .Config.Labels \"role\"}}").contains("api"));
@@ -671,13 +635,13 @@ fn image_config_is_reflected_in_docker_inspect() {
 #[test]
 fn config_file_applies_and_cli_overrides_it() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
     let _g = docker_lock();
     let bin = env!("CARGO_BIN_EXE_scratchsmith"); // the CLI to invoke
     let Some(fixture) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let packed = fixture.to_str().unwrap(); // the (small) binary to pack
@@ -744,12 +708,12 @@ fn config_file_applies_and_cli_overrides_it() {
 #[test]
 fn smoke_run_passes_for_a_plain_binary() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
     let _g = docker_lock();
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tag = scratchsmith::pack::run(bin, &PackOptions::default())
@@ -771,7 +735,7 @@ fn smoke_run_passes_for_a_plain_binary() {
 #[test]
 fn smoke_run_proves_nss_lookups_work_in_image() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
     let _g = docker_lock();
@@ -780,7 +744,7 @@ fn smoke_run_proves_nss_lookups_work_in_image() {
     // + libnss_files) inside the scratch image — the DNS-using-binary case.
     let getent = Path::new("/usr/bin/getent");
     if !getent.exists() {
-        eprintln!("skipping: getent not present");
+        skip_required("getent not present");
         return;
     }
     let tag = scratchsmith::pack::run(getent, &PackOptions::default())
@@ -803,12 +767,12 @@ fn smoke_run_proves_nss_lookups_work_in_image() {
     rmi(&tag);
 }
 
-// --- Sink dispatch (Task 5.1). The OCI-archive and rootfs sinks need no Docker daemon. ---
+// --- Sink dispatch. The OCI-archive and rootfs sinks need no Docker daemon. ---
 
 #[test]
 fn oci_archive_sink_writes_daemonless() {
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -867,7 +831,7 @@ fn root_user_warns_but_still_packs() {
     // fail. Run via the CLI so we can assert the warning on stderr (it's an eprintln!,
     // not a report field); the daemonless OCI-archive sink needs no Docker.
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -899,12 +863,12 @@ fn root_user_warns_but_still_packs() {
 #[test]
 fn docker_load_sink_via_pack() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
     let _g = docker_lock();
     let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
+        skip_required("no id binary to pack");
         return;
     };
     let tag = scratchsmith::pack::pack(
@@ -937,9 +901,15 @@ fn smoke_with_push_is_rejected() {
 #[test]
 fn push_to_local_registry_is_pullable_and_runnable() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
+    // Checked BEFORE the registry starts: under CI this is a panic, and a panic between
+    // `docker run -d` and the teardown at the end leaks the container and its port binding.
+    let Some(bin) = small_fixture() else {
+        skip_required("no id binary to pack");
+        return;
+    };
     let _g = docker_lock();
     // A throwaway registry:2 for a real push → pull round-trip. The push path itself
     // contacts no Docker daemon; docker is only used here to run the registry + verify.
@@ -959,7 +929,7 @@ fn push_to_local_registry_is_pullable_and_runnable() {
         .output()
         .unwrap();
     if !up.status.success() {
-        eprintln!("skipping: could not start registry:2");
+        skip_optional("could not start registry:2");
         return;
     }
     // Wait for the registry port to accept connections.
@@ -970,11 +940,6 @@ fn push_to_local_registry_is_pullable_and_runnable() {
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
-    // pack the small fixture, not the 40 MB debug binary
-    let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
-        return;
-    };
     let reference = "localhost:5099/scratchsmith/test:v1";
     let report = scratchsmith::pack::pack(
         bin,
@@ -1034,9 +999,15 @@ fn push_to_local_registry_is_pullable_and_runnable() {
 #[test]
 fn index_assembles_a_pushed_image_into_an_index() {
     if !docker_available() {
-        eprintln!("skipping: no Docker daemon");
+        skip_required("no Docker daemon");
         return;
     }
+    // Checked BEFORE the registry starts: under CI this is a panic, and a panic between
+    // `docker run -d` and the teardown at the end leaks the container and its port binding.
+    let Some(bin) = small_fixture() else {
+        skip_required("no id binary to pack");
+        return;
+    };
     let _g = docker_lock();
     // A throwaway registry:2 (distinct name/port from the push test above) for a real
     // push -> index round-trip. The index path contacts no Docker daemon.
@@ -1056,7 +1027,7 @@ fn index_assembles_a_pushed_image_into_an_index() {
         .output()
         .unwrap();
     if !up.status.success() {
-        eprintln!("skipping: could not start registry:2");
+        skip_optional("could not start registry:2");
         return;
     }
     for _ in 0..40 {
@@ -1066,10 +1037,6 @@ fn index_assembles_a_pushed_image_into_an_index() {
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
-    let Some(bin) = small_fixture() else {
-        eprintln!("skipping: no id binary to pack");
-        return;
-    };
     // Push a per-arch image, then assemble it into an index. One child here: the full
     // pull -> assemble -> push path is what this exercises end-to-end; multi-child assembly
     // is unit-tested in registry.rs (a second real arch needs cross-arch hardware).
